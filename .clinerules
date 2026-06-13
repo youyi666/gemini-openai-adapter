@@ -1,0 +1,13 @@
+# Gemini OpenAI Adapter project rules
+
+- Respond to the user in Chinese by default.
+- The normal repository root is `D:\GeminiAPI\Gemini-API`.
+- This machine uses Windows PowerShell. Do not use `&&`; use `;` or separate command calls. Prefer `Set-Location "D:\GeminiAPI\Gemini-API"; command`.
+- Check PowerShell command success with `$LASTEXITCODE`. Do not claim success if visible output contains `fatal:`, `ParserError`, `InvalidEndOfLine`, or `^C`.
+- Treat the upstream Gemini-API core as read-only unless the user explicitly asks otherwise. Prefer adapter changes in `openai_adapter_server.py` and adapter helper files.
+- Never read, write, summarize, or commit secrets and local logs: `gemini_cookies.local.json`, `adapter_env.local.ps1`, `adapter_usage*.jsonl`, `adapter_forwarded_prompt.debug.txt`, `.env*`, or files containing token/password/secret/cookie values.
+- For existing files, read the relevant current content first and use `replace_in_file` for localized edits. Use `write_to_file` only for new files or complete small-file rewrites.
+- If the user asks to run a command, inspect Git status, or explain code, do not modify files.
+- Do not write user instructions, command text, XML tool tags, or surrounding chat text into project files unless the user explicitly says that exact text is desired file content.
+- Before `git commit` or `git push`, inspect status and diff summary. Only commit or push when the user explicitly asks for it.
+- Ask for confirmation before destructive operations such as deletes, broad moves, `git reset`, or `git checkout --`.

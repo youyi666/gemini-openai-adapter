@@ -1,0 +1,41 @@
+# Secrets and local-only configuration
+.env
+.env.*
+cookies.json
+*.cookies
+gemini_cookies.local.json
+adapter_env.local.ps1
+local_settings.py
+
+# Adapter logs, usage data, prompt dumps, and test payloads
+adapter_usage*.jsonl
+adapter_forwarded_prompt.debug.txt
+adapter_test_*.json
+usage-sync/adapter_usage*.jsonl
+test_cline_write.txt
+*.log
+*.tmp
+
+# Generated Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and build outputs
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# Git and editor internals
+.git/
+.vscode/
+
+# Large/manual prompt captures from adapter debugging
+提示词*.txt

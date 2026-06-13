@@ -35,6 +35,11 @@ $env:OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_CHARS = "120000"
 
 When Cline asks Gemini to inspect an explicitly named source file, the adapter can attach a read-only copy of that file to the prompt. This helps Gemini continue even when it misunderstands Cline's XML tool results. Secret-looking files such as cookies, local env files, usage logs, token/password files, and debug prompts are blocked from this local context.
 
+This repository also includes:
+
+- `.clineignore` to keep secrets, logs, caches, usage files, and prompt dumps out of Cline context.
+- `.clinerules` to keep per-task guidance short: PowerShell syntax, safe file edits, protected local files, and Git confirmation rules.
+
 The compact prompt also preserves the core Cline action tools:
 
 - `read_file`, `list_files`, `search_files`
