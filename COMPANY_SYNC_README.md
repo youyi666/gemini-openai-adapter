@@ -45,6 +45,12 @@ The compact prompt also preserves the core Cline action tools:
 
 For existing files, ask Cline to prefer `replace_in_file`. Use a small disposable file first when validating a new machine setup.
 
+The compact prompt now also tells Cline not to mix tasks:
+
+- Only use write/edit tools when the current task explicitly asks for file changes.
+- Do not write command text, task instructions, XML tags, or surrounding chat text into files.
+- If a verification read shows unrelated instructions inside a file, correct the file before continuing.
+
 ## Windows PowerShell command tips
 
 The compact prompt tells Cline to avoid Unix-style command chaining in Windows PowerShell:

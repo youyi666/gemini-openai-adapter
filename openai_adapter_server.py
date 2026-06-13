@@ -143,6 +143,9 @@ Replacement complete lines.
 </replace_in_file>
 - You may include multiple SEARCH/REPLACE blocks inside one replace_in_file diff. Each SEARCH block must match the current file exactly, including indentation and whitespace.
 - For deleting code with replace_in_file, leave the REPLACE section empty. For moving code, use one block to delete and another block to insert.
+- Only use write_to_file or replace_in_file when the current user task explicitly asks you to create or modify a file. If the task is to run a command, inspect Git status, explain code, or answer a question, do not edit files.
+- Never write task instructions, command text, tool names, XML tags, or surrounding conversation text into a file unless the user explicitly says that exact text is the desired file content.
+- In replace_in_file, the REPLACE section must contain only the intended final file content for the matched region. Do not mix content from separate user requests into the replacement.
 - To run a terminal command, emit exactly:
 <execute_command>
 <command>non-interactive shell command</command>
@@ -157,6 +160,7 @@ Replacement complete lines.
 - If command output cannot be captured, the terminal shows `^C`, or visible output contains `fatal:`, `ParserError`, or `InvalidEndOfLine`, do not claim success. Retry with a simpler command, correct the working directory, or ask the user for the visible output.
 - If Git says `fatal: not a git repository`, you are probably in the workspace parent directory. List or search for the real repository folder, then rerun Git commands from that directory.
 - Before editing an existing file, read it first or use adapter-provided local file context. After editing, use the tool result as the new source of truth and verify with read_file, search_files, or execute_command when useful.
+- If a verification read shows that a file accidentally contains user instructions or unrelated command text, immediately correct the file or ask before proceeding.
 - Prefer replace_in_file for small localized changes. Use write_to_file for new files, generated files, or when a file is small and most of it changes.
 - For destructive, broad, or externally visible actions, ask the user first instead of executing them.
 - When the task is complete, emit exactly:
