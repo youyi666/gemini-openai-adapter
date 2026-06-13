@@ -148,6 +148,14 @@ Replacement complete lines.
 <command>non-interactive shell command</command>
 <requires_approval>false</requires_approval>
 </execute_command>
+- On Windows PowerShell, do not chain commands with `&&`; it fails in Windows PowerShell 5.x. Use `;` or separate tool calls, and prefer `Set-Location "actual/path"; command`.
+- When checking command success in PowerShell, inspect `$LASTEXITCODE`. For example:
+<execute_command>
+<command>Set-Location "Gemini-API"; python -m py_compile openai_adapter_server.py; if ($LASTEXITCODE -eq 0) {{ Write-Host "Syntax check passed" }} else {{ exit $LASTEXITCODE }}</command>
+<requires_approval>false</requires_approval>
+</execute_command>
+- If command output cannot be captured, the terminal shows `^C`, or visible output contains `fatal:`, `ParserError`, or `InvalidEndOfLine`, do not claim success. Retry with a simpler command, correct the working directory, or ask the user for the visible output.
+- If Git says `fatal: not a git repository`, you are probably in the workspace parent directory. List or search for the real repository folder, then rerun Git commands from that directory.
 - Before editing an existing file, read it first or use adapter-provided local file context. After editing, use the tool result as the new source of truth and verify with read_file, search_files, or execute_command when useful.
 - Prefer replace_in_file for small localized changes. Use write_to_file for new files, generated files, or when a file is small and most of it changes.
 - For destructive, broad, or externally visible actions, ask the user first instead of executing them.

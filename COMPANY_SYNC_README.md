@@ -45,6 +45,22 @@ The compact prompt also preserves the core Cline action tools:
 
 For existing files, ask Cline to prefer `replace_in_file`. Use a small disposable file first when validating a new machine setup.
 
+## Windows PowerShell command tips
+
+The compact prompt tells Cline to avoid Unix-style command chaining in Windows PowerShell:
+
+- Do not use `&&` in Windows PowerShell 5.x.
+- Use `;` or separate command calls instead.
+- Prefer `Set-Location "Gemini-API"; git status --short` over `cd Gemini-API && git status --short`.
+- For verification commands, check `$LASTEXITCODE` before claiming success.
+- If visible terminal output contains `fatal:`, `ParserError`, `InvalidEndOfLine`, or `^C`, treat the command as failed even if Cline says the output was not captured.
+
+Example:
+
+```powershell
+Set-Location "Gemini-API"; python -m py_compile openai_adapter_server.py; if ($LASTEXITCODE -eq 0) { Write-Host "Syntax check passed" } else { exit $LASTEXITCODE }
+```
+
 ## Useful URLs
 
 - Health: `http://127.0.0.1:8000/health`

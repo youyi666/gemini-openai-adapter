@@ -212,6 +212,7 @@ adapter_env.local.ps1
 adapter_test_*.json
 adapter_forwarded_prompt.debug.txt
 adapter_usage*.jsonl
+test_cline_write.txt
 !usage-sync/
 !usage-sync/.gitkeep
 !usage-sync/README.md
