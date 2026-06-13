@@ -91,26 +91,45 @@ Ask before destructive filesystem operations or external actions.
 Do not refuse just because you are receiving IDE/tool instructions as text. The host IDE is responsible for executing approved tool calls.
 If current information is requested and no browsing tool result is present, answer from available context and say when live verification is needed.
 
+Critical execution contract:
+- You are operating through Cline. You do not directly access the local file system; Cline executes your XML tool calls and returns the results as conversation messages.
+- Never say "I cannot access your local file system", "I cannot execute XML tools", "I am Gemini, not Cline", or ask the user to paste a file when a Cline tool can be used.
+- If Cline returns a tool result, treat it as real evidence from the user's machine. If it contains file contents, analyze those contents directly.
+- If a tool result is an error, fix the tool call and try the next best tool. For a missing file, list or search the workspace instead of giving up.
+- Relative paths are resolved from the Current Working Directory shown in the environment summary. If a bare filename is not found, search/list likely subdirectories and retry with the discovered relative path.
+- If Cline says "You did not use a tool", your next response must be exactly one XML tool call.
+
 Important Cline tool-use reminders:
 - If the user asks you to view, inspect, read, summarize, or modify a local file, use the relevant file tool instead of asking the user to paste the file.
 - Use one tool call at a time and wait for the tool result before continuing.
 - Do not wrap tool calls in Markdown fences.
+- Do not use placeholder values like "relative/or/absolute/path"; put the actual path from the task or from search/list results.
 - To read a file, emit exactly:
 <read_file>
-<path>relative/or/absolute/path</path>
+<path>actual/file/path</path>
 </read_file>
 - To list files, emit exactly:
 <list_files>
-<path>relative/or/absolute/path</path>
+<path>actual/directory/path</path>
 <recursive>false</recursive>
 </list_files>
 - To search files, emit exactly:
 <search_files>
-<path>relative/or/absolute/path</path>
+<path>actual/directory/path</path>
 <regex>search pattern</regex>
 <file_pattern>*</file_pattern>
 </search_files>
-- After receiving file contents or search results from the tool, continue the task using that result."""
+- When the task is complete, emit exactly:
+<attempt_completion>
+<result>
+Your final answer to the user.
+</result>
+</attempt_completion>
+- If you need more information from the user and no tool can discover it, emit exactly:
+<ask_followup_question>
+<question>Your question.</question>
+</ask_followup_question>
+- After receiving file contents or search results from the tool, continue the task using that result and finish with attempt_completion."""
 
 
 @dataclass(frozen=True)
@@ -358,6 +377,30 @@ def _is_cline_system_prompt(text: str) -> bool:
     return all(marker in text for marker in markers)
 
 
+def _is_cline_self_refusal(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    if not normalized:
+        return False
+    refusal_markers = (
+        "i cannot execute the xml-style tools",
+        "i can't execute the xml-style tools",
+        "i cannot execute those commands",
+        "i cannot access your local file system",
+        "i don't actually have access to your local file system",
+        "i do not have access to your local file system",
+        "i am gemini, your ai collaborator",
+        "but i am gemini",
+        "please copy and paste the contents",
+        "please paste the contents",
+        "无法执行",
+        "无法直接访问",
+        "无法直接读取",
+        "请直接将该文件",
+        "复制并粘贴",
+    )
+    return any(marker in normalized for marker in refusal_markers)
+
+
 def _extract_tag(text: str, tag: str) -> str | None:
     match = re.search(
         rf"<{re.escape(tag)}>\s*(.*?)\s*</{re.escape(tag)}>",
@@ -382,14 +425,30 @@ def _extract_environment_summary(text: str) -> str:
         "# Visual Studio Code Open Tabs",
     )
     summary_lines: list[str] = []
+    file_list_limit = int(_env_float("OPENAI_ADAPTER_ENV_FILE_LIST_LIMIT", 60))
     lines = env.splitlines()
     for index, raw_line in enumerate(lines):
         line = raw_line.strip()
         if line.startswith(wanted_prefixes):
-            if line.startswith("# Current Working Directory") and " Files" in line:
+            is_cwd_line = line.startswith("# Current Working Directory")
+            if is_cwd_line and " Files" in line:
                 line = line.split(" Files", 1)[0]
             summary_lines.append(line)
-            if line.startswith("# Current Working Directory"):
+            if is_cwd_line:
+                listed_files: list[str] = []
+                for next_raw_line in lines[index + 1 :]:
+                    next_line = next_raw_line.rstrip()
+                    if next_line.strip().startswith("#"):
+                        break
+                    if not next_line.strip():
+                        continue
+                    listed_files.append(next_line)
+                    if len(listed_files) >= file_list_limit:
+                        listed_files.append("... (file list truncated)")
+                        break
+                if listed_files:
+                    summary_lines.append("Current working directory files:")
+                    summary_lines.extend(listed_files)
                 continue
             if index + 1 < len(lines):
                 next_line = lines[index + 1].strip()
@@ -461,6 +520,8 @@ def _prepare_messages_for_gemini(
             continue
         if role == "user":
             prepared.append((role, _compact_cline_user_message(text)))
+        elif role == "assistant" and _is_cline_self_refusal(text):
+            logger.info("Dropped prior Cline self-refusal from compact prompt.")
         else:
             prepared.append((role, text))
 
