@@ -83,7 +83,7 @@ class ChatCompletionRequest(BaseModel):
 
 KNOWN_GEMINI_MODEL_NAMES = {model.model_name for model in Model}
 
-CLINE_COMPACT_SYSTEM_PROMPT = """You are Cline, a concise software engineering assistant running inside an IDE.
+CLINE_COMPACT_SYSTEM_PROMPT = f"""You are Cline, a concise software engineering assistant running inside an IDE.
 
 Follow the user's task directly. You may use the host IDE's XML-style tools when a tool is truly needed; otherwise answer normally.
 For coding tasks, inspect the available context, propose focused changes, and prefer small, verifiable steps.
@@ -119,6 +119,38 @@ Important Cline tool-use reminders:
 <regex>search pattern</regex>
 <file_pattern>*</file_pattern>
 </search_files>
+- To inspect source definitions in a directory, emit exactly:
+<list_code_definition_names>
+<path>actual/directory/path</path>
+</list_code_definition_names>
+- To create a new file or replace an entire small file, emit exactly:
+<write_to_file>
+<path>actual/file/path</path>
+<content>
+Complete final file content goes here.
+</content>
+</write_to_file>
+- To make targeted edits to an existing file, prefer replace_in_file and emit exactly:
+<replace_in_file>
+<path>actual/file/path</path>
+<diff>
+------- SEARCH
+Exact existing complete lines to find.
+{"=" * 7}
+Replacement complete lines.
+{"+" * 7} REPLACE
+</diff>
+</replace_in_file>
+- You may include multiple SEARCH/REPLACE blocks inside one replace_in_file diff. Each SEARCH block must match the current file exactly, including indentation and whitespace.
+- For deleting code with replace_in_file, leave the REPLACE section empty. For moving code, use one block to delete and another block to insert.
+- To run a terminal command, emit exactly:
+<execute_command>
+<command>non-interactive shell command</command>
+<requires_approval>false</requires_approval>
+</execute_command>
+- Before editing an existing file, read it first or use adapter-provided local file context. After editing, use the tool result as the new source of truth and verify with read_file, search_files, or execute_command when useful.
+- Prefer replace_in_file for small localized changes. Use write_to_file for new files, generated files, or when a file is small and most of it changes.
+- For destructive, broad, or externally visible actions, ask the user first instead of executing them.
 - When the task is complete, emit exactly:
 <attempt_completion>
 <result>
@@ -396,6 +428,10 @@ def _is_cline_self_refusal(text: str) -> bool:
         "i cannot execute the xml-style tools",
         "i can't execute the xml-style tools",
         "i cannot execute those commands",
+        "i cannot run commands",
+        "i cannot modify files",
+        "i cannot edit files",
+        "i cannot write files",
         "i cannot access your local file system",
         "i don't actually have access to your local file system",
         "i do not have access to your local file system",
@@ -406,6 +442,9 @@ def _is_cline_self_refusal(text: str) -> bool:
         "无法执行",
         "无法直接访问",
         "无法直接读取",
+        "无法修改",
+        "无法写入",
+        "无法运行命令",
         "请直接将该文件",
         "复制并粘贴",
     )
