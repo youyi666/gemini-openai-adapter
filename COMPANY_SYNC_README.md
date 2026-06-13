@@ -22,6 +22,19 @@ This pack contains only the local OpenAI-compatible adapter files. It does not i
 - API Key: `dummy`
 - Model ID: `gemini-3-pro`
 
+## Cline file-reading compatibility
+
+Keep these lines enabled in `adapter_env.local.ps1`:
+
+```powershell
+$env:OPENAI_ADAPTER_PROMPT_MODE = "auto"
+$env:OPENAI_ADAPTER_LOCAL_FILE_CONTEXT = "1"
+$env:OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_FILES = "3"
+$env:OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_CHARS = "120000"
+```
+
+When Cline asks Gemini to inspect an explicitly named source file, the adapter can attach a read-only copy of that file to the prompt. This helps Gemini continue even when it misunderstands Cline's XML tool results. Secret-looking files such as cookies, local env files, usage logs, token/password files, and debug prompts are blocked from this local context.
+
 ## Useful URLs
 
 - Health: `http://127.0.0.1:8000/health`

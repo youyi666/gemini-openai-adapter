@@ -203,6 +203,17 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to %s", name, raw, default)
+        return default
+
+
 def _load_cookies_json(path: str | os.PathLike[str]) -> dict[str, str]:
     """Load common cookie export JSON formats into a flat cookie dictionary."""
 
@@ -486,6 +497,219 @@ def _compact_cline_user_message(text: str) -> str:
     return text
 
 
+LOCAL_CONTEXT_FILE_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/])?(?:[\w .()\-\u4e00-\u9fff]+[\\/])*"
+    r"[\w .()\-\u4e00-\u9fff]+\."
+    r"(?:py|js|jsx|ts|tsx|json|md|txt|yml|yaml|toml|ps1|bat|cmd|html|css|scss|sql|cjs|mjs)",
+    flags=re.IGNORECASE,
+)
+LOCAL_CONTEXT_ALLOWED_EXTENSIONS = {
+    ".bat",
+    ".cjs",
+    ".cmd",
+    ".css",
+    ".html",
+    ".js",
+    ".json",
+    ".jsx",
+    ".md",
+    ".mjs",
+    ".ps1",
+    ".py",
+    ".scss",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+LOCAL_CONTEXT_DENY_SUBSTRINGS = (
+    ".env",
+    "cookie",
+    "cookies",
+    "gemini_cookies.local",
+    "adapter_env.local",
+    "adapter_usage",
+    "adapter_forwarded_prompt",
+    "secret",
+    "token",
+    "password",
+)
+LOCAL_CONTEXT_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "dist",
+    "env",
+    "node_modules",
+    "venv",
+}
+
+
+def _extract_cwd_from_text(text: str) -> Path | None:
+    match = re.search(r"# Current Working Directory\s*\(([^)]+)\)", text)
+    if match:
+        return Path(match.group(1).strip())
+
+    lines = text.splitlines()
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if line.startswith("# Current Working Directory") and index + 1 < len(lines):
+            next_line = lines[index + 1].strip()
+            if next_line and not next_line.startswith("#"):
+                return Path(next_line)
+    return None
+
+
+def _extract_local_file_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for match in LOCAL_CONTEXT_FILE_RE.finditer(text):
+        candidate = match.group(0).strip("`'\"<>[](){}，。；;：:,")
+        normalized = candidate.replace("\\", "/")
+        if normalized.lower() in seen:
+            continue
+        seen.add(normalized.lower())
+        candidates.append(candidate)
+    return candidates
+
+
+def _is_allowed_local_context_path(path: Path) -> bool:
+    lowered = str(path).lower()
+    if path.suffix.lower() not in LOCAL_CONTEXT_ALLOWED_EXTENSIONS:
+        return False
+    return not any(marker in lowered for marker in LOCAL_CONTEXT_DENY_SUBSTRINGS)
+
+
+def _walk_find_file(base: Path, filename: str) -> Path | None:
+    max_files = _env_int("OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_SEARCH_LIMIT", 20000)
+    checked = 0
+    try:
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [
+                dirname
+                for dirname in dirs
+                if dirname not in LOCAL_CONTEXT_SKIP_DIRS
+                and not dirname.startswith(".")
+            ]
+            checked += len(files)
+            if checked > max_files:
+                logger.info(
+                    "Stopped local file context search after %s files under %s",
+                    checked,
+                    base,
+                )
+                return None
+            if filename in files:
+                return Path(root) / filename
+    except OSError:
+        logger.info("Failed to search local context path under %s", base, exc_info=True)
+    return None
+
+
+def _resolve_local_context_path(candidate: str, cwd: Path | None) -> Path | None:
+    raw = Path(candidate.replace("/", os.sep))
+    base_paths = [path for path in (cwd, ROOT, ROOT.parent) if path is not None]
+
+    possible_paths: list[Path] = []
+    if raw.is_absolute():
+        possible_paths.append(raw)
+    else:
+        possible_paths.extend(base / raw for base in base_paths)
+
+    for possible in possible_paths:
+        try:
+            resolved = possible.resolve()
+        except OSError:
+            resolved = possible.absolute()
+        if resolved.is_file() and _is_allowed_local_context_path(resolved):
+            return resolved
+
+    if raw.name and cwd is not None:
+        found = _walk_find_file(cwd, raw.name)
+        if found is not None and _is_allowed_local_context_path(found):
+            return found.resolve()
+    return None
+
+
+def _format_local_context_file(path: Path, remaining_chars: int) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    truncated = len(text) > remaining_chars
+    if truncated:
+        text = text[:remaining_chars]
+    suffix = "\n\n[truncated by adapter local file context limit]" if truncated else ""
+    return (
+        f"--- FILE: {path} ---\n"
+        "```text\n"
+        f"{text}{suffix}\n"
+        "```"
+    )
+
+
+def _build_local_file_context(prepared_messages: list[tuple[str, str]]) -> str:
+    if not _env_bool("OPENAI_ADAPTER_LOCAL_FILE_CONTEXT", True):
+        return ""
+
+    combined_text = "\n\n".join(text for _, text in prepared_messages)
+    candidates = _extract_local_file_candidates(combined_text)
+    if not candidates:
+        return ""
+
+    cwd = _extract_cwd_from_text(combined_text)
+    max_files = _env_int("OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_FILES", 3)
+    max_chars = _env_int("OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_CHARS", 120000)
+    resolved_paths: list[Path] = []
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        path = _resolve_local_context_path(candidate, cwd)
+        if path is None:
+            continue
+        key = os.path.normcase(str(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved_paths.append(path)
+        if len(resolved_paths) >= max_files:
+            break
+
+    if not resolved_paths:
+        return ""
+
+    sections: list[str] = []
+    remaining = max_chars
+    for path in resolved_paths:
+        if remaining <= 0:
+            break
+        try:
+            section = _format_local_context_file(path, remaining)
+        except OSError:
+            logger.info("Failed to read local file context: %s", path, exc_info=True)
+            continue
+        sections.append(section)
+        remaining -= len(section)
+
+    if not sections:
+        return ""
+
+    logger.info(
+        "Injected local file context: files=%s chars=%s",
+        len(sections),
+        sum(len(section) for section in sections),
+    )
+    return (
+        "Adapter local file context:\n"
+        "The local adapter read these files because the Cline task explicitly "
+        "referenced them. Treat this as real file content from the user's machine. "
+        "Use it directly; do not ask the user to paste the same file again.\n\n"
+        + "\n\n".join(sections)
+    )
+
+
 def _prepare_messages_for_gemini(
     messages: list[ChatMessage],
 ) -> tuple[list[tuple[str, str]], bool]:
@@ -564,6 +788,10 @@ def _messages_to_prompt(messages: list[ChatMessage]) -> str:
         prompt_parts.append("System instructions:\n" + "\n\n".join(system_parts))
     if conversation_parts:
         prompt_parts.append("Conversation:\n" + "\n\n".join(conversation_parts))
+    if compacted:
+        local_file_context = _build_local_file_context(prepared_messages)
+        if local_file_context:
+            prompt_parts.append(local_file_context)
 
     return "\n\n".join(prompt_parts)
 
