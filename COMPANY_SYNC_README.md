@@ -5,14 +5,19 @@ This repository contains the local OpenAI-compatible adapter plus the vendored G
 ## Company PC setup
 
 1. Clone or copy `youyi666/gemini-openai-adapter` to the company PC.
-2. Run `install_adapter_dependencies.bat`.
-3. Copy `adapter_env.example.ps1` to `adapter_env.local.ps1`.
-4. Copy `gemini_cookies.example.json` to `gemini_cookies.local.json`.
-5. Fill `gemini_cookies.local.json` with the company PC browser's Gemini cookies:
+2. Double-click `START_HERE.bat`.
+3. Use the menu to initialize local config, install dependencies, refresh browser cookies, start the server, and run the smoke test.
+
+Manual fallback:
+
+1. Run `install_adapter_dependencies.bat`.
+2. Copy `adapter_env.example.ps1` to `adapter_env.local.ps1`.
+3. Copy `gemini_cookies.example.json` to `gemini_cookies.local.json`.
+4. Fill `gemini_cookies.local.json` with the company PC browser's Gemini cookies:
    - `__Secure-1PSID`
    - `__Secure-1PSIDTS`
-6. Start the local API with `start_ai_server.bat`.
-7. Open usage dashboard with `open_usage_dashboard.bat`.
+5. Start the local API with `start_ai_server.bat`.
+6. Open usage dashboard with `open_usage_dashboard.bat`.
 
 ## Cline configuration
 

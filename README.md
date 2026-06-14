@@ -1,5 +1,33 @@
 # Gemini OpenAI Adapter
 
+## 同事使用入口
+
+第一次使用时，优先看这两个文件：
+
+```text
+START_HERE.bat        双击打开团队启动菜单
+TEAM_QUICK_START.md   5 分钟快速上手说明
+```
+
+推荐流程：
+
+1. 双击 `START_HERE.bat`。
+2. 选择 `2. 初始化本地配置文件`。
+3. 选择 `3. 安装/更新依赖`。
+4. 确认浏览器里的 Gemini 网页可以正常发送消息。
+5. 选择 `6. 刷新浏览器 Cookie`。
+6. 选择 `4. 启动服务`。
+7. 新开一个菜单窗口，选择 `7. 运行兼容自测`。
+
+自测通过后，在 Cline 中配置：
+
+```text
+Provider: OpenAI Compatible
+Base URL: http://127.0.0.1:8000/v1
+API Key: local
+Model ID: gemini-3-flash
+```
+
 这是一个本地 FastAPI 服务，把 Google Gemini 网页端逆向客户端封装成 OpenAI 兼容接口，方便 Cline、Continue.dev 等 IDE AI 插件把它当作本地 OpenAI 服务使用。
 
 本项目的目标不是重新实现 Gemini 网页协议，而是在保留上游 `gemini_webapi` 客户端的基础上，新增一层 OpenAI API 适配器、Cline 兼容提示词、Cookie 管理、用量统计和本地控制台。
@@ -47,6 +75,9 @@ cli.py
 openai_adapter_server.py               FastAPI OpenAI 兼容服务
 refresh_gemini_cookies_from_browser.py 从 Chrome / Edge 刷新 Gemini Cookie
 capture_edge_gemini_cookies_cdp.py     Edge CDP Cookie 抓取辅助脚本
+START_HERE.bat                         团队统一入口
+team_menu.py                           中文启动菜单
+TEAM_QUICK_START.md                    同事 5 分钟快速上手说明
 adapter_env.example.ps1                PowerShell 环境变量示例
 gemini_cookies.example.json            Cookie JSON 示例
 start_ai_server.bat                    双击启动服务

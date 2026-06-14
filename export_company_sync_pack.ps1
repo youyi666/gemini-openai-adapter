@@ -18,6 +18,8 @@ $files = @(
     "openai_adapter_server.py",
     "refresh_gemini_cookies_from_browser.py",
     "capture_edge_gemini_cookies_cdp.py",
+    "team_menu.py",
+    "START_HERE.bat",
     "start_ai_server.bat",
     "open_usage_dashboard.bat",
     "install_adapter_dependencies.bat",
@@ -26,6 +28,7 @@ $files = @(
     "export_company_sync_pack.ps1",
     ".clinerules",
     ".clineignore",
+    ".gitattributes",
     ".gitignore"
 )
 
