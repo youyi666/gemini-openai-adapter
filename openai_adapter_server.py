@@ -82,6 +82,37 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
 
 
+class RateLimitTestRequest(BaseModel):
+    """Conservative local probe for adapter/upstream rate-limit behavior."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str = Field(default="gemini-3-flash")
+    prompt: str = Field(default="hi")
+    auto_mode: bool = False
+    auto_profile: str = Field(default="balanced")
+    start_parallel: int = Field(default=1, ge=1, le=3)
+    max_parallel: int = Field(default=4, ge=1, le=8)
+    max_rounds: int = Field(default=4, ge=1, le=6)
+    max_total_requests: int = Field(default=12, ge=1, le=30)
+    base_delay_seconds: float = Field(default=2.0, ge=0.25, le=10.0)
+    min_delay_seconds: float = Field(default=0.5, ge=0.1, le=5.0)
+    per_request_timeout_seconds: float = Field(default=45.0, ge=5.0, le=120.0)
+    stop_on_first_error: bool = True
+
+
+class PromptSizeTestRequest(BaseModel):
+    """Conservative probe for practical prompt-size limits."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str = Field(default="gemini-3-flash")
+    auto_profile: str = Field(default="balanced")
+    max_target_tokens: int = Field(default=32_000, ge=100, le=128_000)
+    per_request_timeout_seconds: float = Field(default=180.0, ge=15.0, le=300.0)
+    stop_on_first_error: bool = True
+
+
 KNOWN_GEMINI_MODEL_NAMES = {model.model_name for model in Model}
 
 CLINE_COMPACT_SYSTEM_PROMPT = f"""You are Cline, a concise software engineering assistant running inside an IDE.
@@ -304,6 +335,15 @@ def _cookie_writeback_enabled() -> bool:
 
 def _cookie_writeback_interval_seconds() -> int:
     return max(30, _env_int("OPENAI_ADAPTER_COOKIE_WRITEBACK_INTERVAL_SECONDS", 60))
+
+
+def _cookie_refresh_config() -> dict[str, str]:
+    browser = os.getenv("OPENAI_ADAPTER_COOKIE_BROWSER", "auto").strip() or "auto"
+    profile = os.getenv("OPENAI_ADAPTER_COOKIE_PROFILE", "Default").strip() or "Default"
+    return {
+        "browser": browser,
+        "profile": profile,
+    }
 
 
 def _cookie_writeback_path() -> Path | None:
@@ -786,6 +826,516 @@ async def _refresh_cookies_and_reload_client(request: Request) -> dict[str, Any]
             "cookie_refresh": refresh_report,
             "cookie_cache": cache_report,
         }
+
+
+def _extract_http_status_from_error(exc: BaseException) -> int | None:
+    text = str(exc)
+    patterns = (
+        r"status:\s*(\d{3})",
+        r"\[(\d{3})\]",
+        r"status_code\s*[=:]\s*(\d{3})",
+        r"\b(\d{3})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _classify_probe_error(exc: BaseException, client: GeminiClient | None = None) -> dict[str, Any]:
+    status_code = _extract_http_status_from_error(exc)
+    text = str(exc)
+    lowered = text.lower()
+    if _looks_like_auth_failure(exc, client):
+        category = "auth"
+    elif status_code == 413 or any(
+        marker in lowered
+        for marker in (
+            "prompt too large",
+            "context length",
+            "too many tokens",
+            "token limit",
+            "exceeds",
+            "payload too large",
+            "request entity too large",
+        )
+    ):
+        category = "prompt_too_large"
+    elif status_code == 429 or any(marker in lowered for marker in ("rate limit", "too many", "quota")):
+        category = "rate_limit"
+    elif isinstance(exc, (asyncio.TimeoutError, GeminiTimeoutError)) or "timeout" in lowered:
+        category = "timeout"
+    else:
+        category = "upstream_error"
+
+    return {
+        "ok": False,
+        "category": category,
+        "status_code": status_code,
+        "error_type": exc.__class__.__name__,
+        "message": text[:500],
+    }
+
+
+async def _rate_limit_probe_once(
+    client: GeminiClient,
+    openai_model: str,
+    gemini_model: str,
+    prompt: str,
+    round_index: int,
+    request_index: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    completion_id = _completion_id()
+    probe_prompt = (
+        f"{prompt}\n\n"
+        f"Probe id: {completion_id}. Round: {round_index}. Request: {request_index}."
+    )
+    started = time.perf_counter()
+    try:
+        output = await asyncio.wait_for(
+            client.generate_content(
+                probe_prompt,
+                model=gemini_model,
+                current_retry=_upstream_retry_count(),
+            ),
+            timeout=timeout_seconds,
+        )
+        elapsed = time.perf_counter() - started
+        text = getattr(output, "text", "") or ""
+        usage, cost_estimate = _build_usage(gemini_model, probe_prompt, text)
+        _record_usage(
+            completion_id,
+            openai_model,
+            gemini_model,
+            False,
+            usage,
+            cost_estimate,
+        )
+        return {
+            "ok": True,
+            "id": completion_id,
+            "latency_seconds": round(elapsed, 3),
+            "response_chars": len(text),
+            "usage": usage,
+            "cost_estimate": cost_estimate,
+        }
+    except Exception as exc:
+        elapsed = time.perf_counter() - started
+        error = _classify_probe_error(exc, client)
+        error["id"] = completion_id
+        error["latency_seconds"] = round(elapsed, 3)
+        return error
+
+
+async def _run_rate_limit_probe(
+    client: GeminiClient,
+    payload: RateLimitTestRequest,
+) -> dict[str, Any]:
+    _ensure_client_authenticated(client)
+    openai_model = payload.model
+    gemini_model = _select_gemini_model(payload.model)
+    auto_profile = (payload.auto_profile or "balanced").strip().lower()
+    auto_plans: dict[str, dict[str, Any]] = {
+        "safe": {
+            "label": "稳妥自动",
+            "parallel_plan": [1, 2, 4, 4],
+            "base_delay_seconds": 2.0,
+            "min_delay_seconds": 0.5,
+            "per_request_timeout_seconds": 60.0,
+        },
+        "balanced": {
+            "label": "标准自动",
+            "parallel_plan": [1, 2, 4, 6, 8],
+            "base_delay_seconds": 1.5,
+            "min_delay_seconds": 0.3,
+            "per_request_timeout_seconds": 75.0,
+        },
+        "edge": {
+            "label": "摸边界自动",
+            "parallel_plan": [1, 2, 4, 6, 8, 8],
+            "base_delay_seconds": 1.0,
+            "min_delay_seconds": 0.2,
+            "per_request_timeout_seconds": 90.0,
+        },
+    }
+    if auto_profile not in auto_plans:
+        auto_profile = "balanced"
+
+    if payload.auto_mode:
+        selected_plan = auto_plans[auto_profile]
+        parallel_plan = [int(item) for item in selected_plan["parallel_plan"]]
+        max_total_requests = min(sum(parallel_plan), 30)
+        max_rounds = len(parallel_plan)
+        start_parallel = parallel_plan[0]
+        max_parallel = max(parallel_plan)
+        base_delay = float(selected_plan["base_delay_seconds"])
+        min_delay = float(selected_plan["min_delay_seconds"])
+        timeout_seconds = float(selected_plan["per_request_timeout_seconds"])
+    else:
+        max_total_requests = min(max(1, payload.max_total_requests), 30)
+        max_rounds = min(max(1, payload.max_rounds), 6)
+        start_parallel = min(max(1, payload.start_parallel), 3)
+        max_parallel = min(max(start_parallel, payload.max_parallel), 8)
+        parallel_plan = [
+            min(start_parallel * (2**round_index), max_parallel)
+            for round_index in range(max_rounds)
+        ]
+        base_delay = max(0.25, min(payload.base_delay_seconds, 10.0))
+        min_delay = max(0.1, min(payload.min_delay_seconds, base_delay))
+        timeout_seconds = max(5.0, min(payload.per_request_timeout_seconds, 120.0))
+
+    logger.info(
+        "Starting rate-limit probe: model=%s gemini_model=%s auto_mode=%s "
+        "auto_profile=%s parallel_plan=%s max_total_requests=%s",
+        openai_model,
+        gemini_model,
+        payload.auto_mode,
+        auto_profile,
+        parallel_plan,
+        max_total_requests,
+    )
+
+    report: dict[str, Any] = {
+        "ok": True,
+        "model": openai_model,
+        "gemini_model": gemini_model,
+        "started_at": datetime.now(tz=timezone.utc).isoformat(),
+        "safe_caps": {
+            "max_parallel": 8,
+            "max_rounds": 6,
+            "max_total_requests": 30,
+        },
+        "settings": {
+            "auto_mode": payload.auto_mode,
+            "auto_profile": auto_profile if payload.auto_mode else None,
+            "auto_profile_label": auto_plans[auto_profile]["label"] if payload.auto_mode else None,
+            "parallel_plan": parallel_plan,
+            "start_parallel": start_parallel,
+            "max_parallel": max_parallel,
+            "max_rounds": max_rounds,
+            "max_total_requests": max_total_requests,
+            "base_delay_seconds": base_delay,
+            "min_delay_seconds": min_delay,
+            "per_request_timeout_seconds": timeout_seconds,
+            "stop_on_first_error": payload.stop_on_first_error,
+        },
+        "rounds": [],
+        "summary": {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "fastest_successful_rps": 0.0,
+            "highest_successful_parallel": 0,
+            "last_fully_successful_round": None,
+            "first_failed_round": None,
+            "limit_signal": None,
+        },
+    }
+
+    remaining = max_total_requests
+    stop_reason = "completed"
+    for zero_based_round in range(max_rounds):
+        if remaining <= 0:
+            stop_reason = "max_total_requests_reached"
+            break
+
+        round_number = zero_based_round + 1
+        parallel = min(parallel_plan[zero_based_round], max_parallel, remaining)
+        delay_after_round = max(min_delay, round(base_delay * (0.65**zero_based_round), 3))
+        round_started = time.perf_counter()
+
+        logger.info(
+            "Rate-limit probe round %s: parallel=%s remaining_before=%s",
+            round_number,
+            parallel,
+            remaining,
+        )
+        results = await asyncio.gather(
+            *(
+                _rate_limit_probe_once(
+                    client,
+                    openai_model,
+                    gemini_model,
+                    payload.prompt.strip() or "hi",
+                    round_number,
+                    request_index + 1,
+                    timeout_seconds,
+                )
+                for request_index in range(parallel)
+            )
+        )
+        elapsed = max(time.perf_counter() - round_started, 0.001)
+        remaining -= parallel
+
+        successes = [item for item in results if item.get("ok")]
+        failures = [item for item in results if not item.get("ok")]
+        categories: dict[str, int] = {}
+        for item in failures:
+            category = str(item.get("category") or "unknown")
+            categories[category] = categories.get(category, 0) + 1
+
+        estimated_rps = round(parallel / elapsed, 3)
+        round_report = {
+            "round": round_number,
+            "parallel": parallel,
+            "elapsed_seconds": round(elapsed, 3),
+            "estimated_rps": estimated_rps,
+            "successes": len(successes),
+            "failures": len(failures),
+            "error_categories": categories,
+            "first_failure": failures[0] if failures else None,
+            "results": results,
+            "delay_after_round_seconds": delay_after_round if remaining > 0 else 0,
+        }
+        report["rounds"].append(round_report)
+
+        summary = report["summary"]
+        summary["total_requests"] += parallel
+        summary["successful_requests"] += len(successes)
+        summary["failed_requests"] += len(failures)
+        if successes:
+            summary["fastest_successful_rps"] = max(
+                float(summary["fastest_successful_rps"]),
+                estimated_rps,
+            )
+            summary["highest_successful_parallel"] = max(
+                int(summary["highest_successful_parallel"]),
+                parallel,
+            )
+        if len(successes) == parallel and not failures:
+            summary["last_fully_successful_round"] = {
+                "round": round_number,
+                "parallel": parallel,
+                "estimated_rps": estimated_rps,
+                "elapsed_seconds": round(elapsed, 3),
+            }
+
+        logger.info(
+            "Rate-limit probe round %s complete: successes=%s failures=%s rps=%s",
+            round_number,
+            len(successes),
+            len(failures),
+            estimated_rps,
+        )
+
+        if failures:
+            summary["first_failed_round"] = {
+                "round": round_number,
+                "parallel": parallel,
+                "estimated_rps": estimated_rps,
+                "elapsed_seconds": round(elapsed, 3),
+                "error_categories": categories,
+            }
+            summary["limit_signal"] = failures[0]
+            if payload.stop_on_first_error:
+                stop_reason = "first_error"
+                break
+
+        if remaining > 0 and round_number < max_rounds:
+            await asyncio.sleep(delay_after_round)
+
+    report["finished_at"] = datetime.now(tz=timezone.utc).isoformat()
+    report["stop_reason"] = stop_reason
+    report["account_status"] = _account_status_info(client)
+    await _write_client_cookies_back(client, "rate-limit-probe")
+    return report
+
+
+def _prompt_size_target_plan(profile: str, max_target_tokens: int) -> tuple[str, list[int]]:
+    profile = (profile or "balanced").strip().lower()
+    plans: dict[str, tuple[str, list[int]]] = {
+        "safe": ("稳妥体积", [1_000, 4_000, 8_000, 16_000]),
+        "balanced": ("标准体积", [1_000, 4_000, 8_000, 16_000, 32_000]),
+        "edge": ("摸边界体积", [1_000, 8_000, 16_000, 32_000, 64_000]),
+        "expert": ("专家体积", [1_000, 8_000, 16_000, 32_000, 64_000, 128_000]),
+    }
+    if profile not in plans:
+        profile = "balanced"
+    label, plan = plans[profile]
+    capped = [tokens for tokens in plan if tokens <= max_target_tokens]
+    if not capped:
+        capped = [min(max_target_tokens, plan[0])]
+    return label, capped
+
+
+def _build_prompt_size_probe_prompt(target_tokens: int) -> str:
+    header = (
+        "You are running a prompt-size boundary probe. "
+        "Ignore the padding content below and reply with exactly: OK\n\n"
+    )
+    chunk = (
+        "padding line: alpha beta gamma delta epsilon zeta eta theta iota kappa "
+        "lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega. "
+        "This sentence exists only to increase the input prompt size.\n"
+    )
+    target_tokens = max(100, min(int(target_tokens), 128_000))
+    header_tokens = _estimate_tokens(header)
+    chunk_tokens = max(1, _estimate_tokens(chunk))
+    repeat_count = max(1, int((target_tokens - header_tokens + chunk_tokens - 1) / chunk_tokens))
+    prompt = header + chunk * repeat_count
+
+    # Trim near the target according to the adapter's own estimator.
+    while _estimate_tokens(prompt) > target_tokens + 64 and len(prompt) > len(header):
+        prompt = prompt[:-256]
+    while _estimate_tokens(prompt) < target_tokens - 64:
+        prompt += chunk
+    return prompt
+
+
+async def _prompt_size_probe_once(
+    client: GeminiClient,
+    openai_model: str,
+    gemini_model: str,
+    target_tokens: int,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    completion_id = _completion_id()
+    probe_prompt = _build_prompt_size_probe_prompt(target_tokens)
+    estimated_prompt_tokens = _estimate_tokens(probe_prompt)
+    started = time.perf_counter()
+    try:
+        output = await asyncio.wait_for(
+            client.generate_content(
+                probe_prompt,
+                model=gemini_model,
+                current_retry=_upstream_retry_count(),
+            ),
+            timeout=timeout_seconds,
+        )
+        elapsed = time.perf_counter() - started
+        text = getattr(output, "text", "") or ""
+        usage, cost_estimate = _build_usage(gemini_model, probe_prompt, text)
+        _record_usage(
+            completion_id,
+            openai_model,
+            gemini_model,
+            False,
+            usage,
+            cost_estimate,
+        )
+        return {
+            "ok": True,
+            "id": completion_id,
+            "target_prompt_tokens": target_tokens,
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "prompt_chars": len(probe_prompt),
+            "latency_seconds": round(elapsed, 3),
+            "response_chars": len(text),
+            "usage": usage,
+            "cost_estimate": cost_estimate,
+        }
+    except Exception as exc:
+        elapsed = time.perf_counter() - started
+        error = _classify_probe_error(exc, client)
+        error.update(
+            {
+                "id": completion_id,
+                "target_prompt_tokens": target_tokens,
+                "estimated_prompt_tokens": estimated_prompt_tokens,
+                "prompt_chars": len(probe_prompt),
+                "latency_seconds": round(elapsed, 3),
+            }
+        )
+        return error
+
+
+async def _run_prompt_size_probe(
+    client: GeminiClient,
+    payload: PromptSizeTestRequest,
+) -> dict[str, Any]:
+    _ensure_client_authenticated(client)
+    openai_model = payload.model
+    gemini_model = _select_gemini_model(payload.model)
+    max_target_tokens = min(max(100, payload.max_target_tokens), 128_000)
+    timeout_seconds = max(15.0, min(payload.per_request_timeout_seconds, 300.0))
+    profile_label, target_plan = _prompt_size_target_plan(
+        payload.auto_profile,
+        max_target_tokens,
+    )
+
+    logger.info(
+        "Starting prompt-size probe: model=%s gemini_model=%s profile=%s "
+        "target_plan=%s timeout=%s",
+        openai_model,
+        gemini_model,
+        payload.auto_profile,
+        target_plan,
+        timeout_seconds,
+    )
+
+    report: dict[str, Any] = {
+        "ok": True,
+        "model": openai_model,
+        "gemini_model": gemini_model,
+        "started_at": datetime.now(tz=timezone.utc).isoformat(),
+        "safe_caps": {
+            "max_target_tokens": 128_000,
+            "max_steps": 6,
+        },
+        "settings": {
+            "auto_profile": payload.auto_profile,
+            "auto_profile_label": profile_label,
+            "target_plan": target_plan,
+            "max_target_tokens": max_target_tokens,
+            "per_request_timeout_seconds": timeout_seconds,
+            "stop_on_first_error": payload.stop_on_first_error,
+        },
+        "steps": [],
+        "summary": {
+            "successful_steps": 0,
+            "failed_steps": 0,
+            "largest_successful_prompt_tokens": 0,
+            "largest_successful_prompt_chars": 0,
+            "first_failed_target_tokens": None,
+            "limit_signal": None,
+        },
+    }
+
+    stop_reason = "completed"
+    for index, target_tokens in enumerate(target_plan, start=1):
+        result = await _prompt_size_probe_once(
+            client,
+            openai_model,
+            gemini_model,
+            target_tokens,
+            timeout_seconds,
+        )
+        step = {
+            "step": index,
+            "target_prompt_tokens": target_tokens,
+            **result,
+        }
+        report["steps"].append(step)
+
+        summary = report["summary"]
+        if result.get("ok"):
+            summary["successful_steps"] += 1
+            summary["largest_successful_prompt_tokens"] = max(
+                int(summary["largest_successful_prompt_tokens"]),
+                int(result.get("estimated_prompt_tokens") or 0),
+            )
+            summary["largest_successful_prompt_chars"] = max(
+                int(summary["largest_successful_prompt_chars"]),
+                int(result.get("prompt_chars") or 0),
+            )
+        else:
+            summary["failed_steps"] += 1
+            summary["first_failed_target_tokens"] = target_tokens
+            summary["limit_signal"] = result
+            if payload.stop_on_first_error:
+                stop_reason = "first_error"
+                break
+
+    report["finished_at"] = datetime.now(tz=timezone.utc).isoformat()
+    report["stop_reason"] = stop_reason
+    report["account_status"] = _account_status_info(client)
+    await _write_client_cookies_back(client, "prompt-size-probe")
+    return report
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -1284,6 +1834,22 @@ def _estimate_tokens(text: str) -> int:
     cjk_chars = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", text))
     non_cjk_chars = max(0, len(text) - cjk_chars)
     return max(1, int(round(cjk_chars + non_cjk_chars / 4)))
+
+
+def _max_prompt_tokens() -> int:
+    return max(0, _env_int("OPENAI_ADAPTER_MAX_PROMPT_TOKENS", 32_000))
+
+
+def _ensure_prompt_budget(prompt: str) -> int:
+    prompt_tokens = _estimate_tokens(prompt)
+    max_prompt_tokens = _max_prompt_tokens()
+    if max_prompt_tokens and prompt_tokens > max_prompt_tokens:
+        raise ValueError(
+            "Prompt is too large for the configured Gemini adapter budget: "
+            f"estimated {prompt_tokens:,} tokens > limit {max_prompt_tokens:,}. "
+            "Split the task into smaller phases or reduce the attached context."
+        )
+    return prompt_tokens
 
 
 def _get_usage_log_path() -> Path:
@@ -2333,6 +2899,35 @@ def _adapter_console_html() -> str:
       flex-wrap: wrap;
       gap: 7px;
     }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin: 12px 0;
+    }
+    .field {
+      display: grid;
+      gap: 5px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .field input,
+    .field select {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 7px 9px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+    .hint {
+      margin-top: 8px;
+      color: var(--amber);
+      line-height: 1.6;
+      font-size: 13px;
+    }
     @media (max-width: 780px) {
       header,
       .split {
@@ -2367,6 +2962,8 @@ def _adapter_console_html() -> str:
     <a href="#usage">用量热力图</a>
     <a href="#models">模型</a>
     <a href="#test">快速测试</a>
+    <a href="#limit">限流探测</a>
+    <a href="#prompt-size">Prompt 体积</a>
     <a href="#config">Cline 配置</a>
   </nav>
 
@@ -2380,7 +2977,7 @@ def _adapter_console_html() -> str:
     <div class="split">
       <div>
         <h2>Cookie 管理</h2>
-        <p class="muted">点击按钮会从本机 Chrome / Edge 读取 Gemini 登录 Cookie，清理本项目 Cookie 缓存，并热重载 Gemini 客户端。页面只显示 Cookie 是否存在和长度，不显示真实值。</p>
+        <p class="muted">点击按钮会按当前配置从本机 Chrome / Edge 读取 Gemini 登录 Cookie，清理本项目 Cookie 缓存，并热重载 Gemini 客户端。页面只显示 Cookie 是否存在和长度，不显示真实值。</p>
         <div class="status-line">
           <button id="refreshCookieBtn2" class="btn" type="button">刷新 Cookie 并重载客户端</button>
           <a class="pill" href="/health" target="_blank" rel="noreferrer">查看 /health JSON</a>
@@ -2438,6 +3035,88 @@ def _adapter_console_html() -> str:
     </div>
   </section>
 
+  <section id="limit" class="section">
+    <div class="split">
+      <div>
+        <h2>限流探测</h2>
+        <p class="muted">自动挡会逐轮提高并发数量，并缩短轮次间隔，用来观察当前账号、浏览器 Cookie 和模型在本地适配器下的可承受边界。</p>
+        <p class="hint">这会真实调用 Gemini。默认“标准自动”会按 1、2、4、6、8 并发逐步测试，最多 21 次请求，遇到 429/鉴权/超时/上游错误会停止。不要频繁重复跑。</p>
+        <div class="form-grid">
+          <label class="field">测试模式
+            <select id="limitMode">
+              <option value="auto" selected>自动挡（推荐）</option>
+              <option value="manual">手动挡</option>
+            </select>
+          </label>
+          <label class="field">自动强度
+            <select id="limitProfile">
+              <option value="balanced" selected>标准自动：1,2,4,6,8</option>
+              <option value="safe">稳妥自动：1,2,4,4</option>
+              <option value="edge">摸边界：1,2,4,6,8,8</option>
+            </select>
+          </label>
+          <label class="field">模型
+            <select id="limitModel">
+              <option value="gemini-3-flash">gemini-3-flash</option>
+              <option value="gemini-3-pro">gemini-3-pro</option>
+            </select>
+          </label>
+          <label class="field manual-field">最大轮数
+            <input id="limitRounds" type="number" min="1" max="6" value="4">
+          </label>
+          <label class="field manual-field">总请求上限
+            <input id="limitTotal" type="number" min="1" max="30" value="12">
+          </label>
+          <label class="field manual-field">最高并发
+            <input id="limitParallel" type="number" min="1" max="8" value="4">
+          </label>
+          <label class="field manual-field">初始轮间隔秒
+            <input id="limitDelay" type="number" min="0.25" max="10" step="0.25" value="2">
+          </label>
+        </div>
+        <div class="status-line">
+          <span id="autoPlanHint" class="pill">自动计划：1 -> 2 -> 4 -> 6 -> 8，最多 21 次</span>
+          <button id="rateLimitBtn" class="btn secondary" type="button">开始自动探测</button>
+        </div>
+      </div>
+      <pre id="rateLimitOutput" class="output">尚未探测。</pre>
+    </div>
+  </section>
+
+  <section id="prompt-size" class="section">
+    <div class="split">
+      <div>
+        <h2>Prompt 体积探测</h2>
+        <p class="muted">逐档增加单次输入 prompt 的估算 tokens，用来观察“一个任务最多能塞多少上下文”。每档只发 1 次请求，并要求模型只回复 OK。</p>
+        <p class="hint">这会真实消耗输入 tokens。建议先跑“标准体积”到 32k；如果全成功，再跑“摸边界体积”到 64k，最后才考虑专家体积到 128k。</p>
+        <div class="form-grid">
+          <label class="field">模型
+            <select id="promptSizeModel">
+              <option value="gemini-3-flash">gemini-3-flash</option>
+              <option value="gemini-3-pro">gemini-3-pro</option>
+            </select>
+          </label>
+          <label class="field">测试强度
+            <select id="promptSizeProfile">
+              <option value="balanced" selected>标准体积：1k,4k,8k,16k,32k</option>
+              <option value="safe">稳妥体积：1k,4k,8k,16k</option>
+              <option value="edge">摸边界体积：1k,8k,16k,32k,64k</option>
+              <option value="expert">专家体积：1k,8k,16k,32k,64k,128k</option>
+            </select>
+          </label>
+          <label class="field">最高目标 tokens
+            <input id="promptSizeMax" type="number" min="1000" max="128000" step="1000" value="32000">
+          </label>
+        </div>
+        <div class="status-line">
+          <span id="promptSizePlanHint" class="pill">计划：1k -> 4k -> 8k -> 16k -> 32k</span>
+          <button id="promptSizeBtn" class="btn secondary" type="button">开始体积探测</button>
+        </div>
+      </div>
+      <pre id="promptSizeOutput" class="output">尚未探测。</pre>
+    </div>
+  </section>
+
   <section id="config" class="section">
     <h2>Cline / Continue 配置速查</h2>
     <table class="quick-table">
@@ -2472,7 +3151,7 @@ function money(value, prefix) {
 }
 
 function setBusy(isBusy) {
-  ["refreshPageBtn", "refreshCookieBtn", "refreshCookieBtn2", "probeBtn"].forEach((id) => {
+  ["refreshPageBtn", "refreshCookieBtn", "refreshCookieBtn2", "probeBtn", "rateLimitBtn", "promptSizeBtn"].forEach((id) => {
     const el = $(id);
     if (el) el.disabled = isBusy;
   });
@@ -2513,6 +3192,8 @@ async function loadHealth() {
     metric("已认证", status.authenticated ? "true" : "false", authClass),
     metric("Cookie 写回", data.cookie_writeback?.enabled ? "已启用" : "未启用", data.cookie_writeback?.enabled ? "ok" : "warn"),
     metric("写回间隔", `${data.cookie_writeback?.interval_seconds ?? "-"} 秒`),
+    metric("Cookie 浏览器", data.cookie_refresh?.browser || "auto"),
+    metric("Cookie Profile", data.cookie_refresh?.profile || "Default"),
   ].join("");
   $("statusLine").innerHTML = `
     <span class="pill ${status.authenticated ? "ok" : "bad"}">${escapeHtml(status.description || "无状态说明")}</span>
@@ -2660,11 +3341,230 @@ async function runProbe() {
   }
 }
 
+function limitInputNumber(id, fallback) {
+  const value = Number($(id)?.value);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+const autoRateLimitPlans = {
+  safe: { label: "稳妥自动", plan: [1, 2, 4, 4], total: 11 },
+  balanced: { label: "标准自动", plan: [1, 2, 4, 6, 8], total: 21 },
+  edge: { label: "摸边界自动", plan: [1, 2, 4, 6, 8, 8], total: 29 },
+};
+
+const promptSizePlans = {
+  safe: { label: "稳妥体积", plan: [1000, 4000, 8000, 16000] },
+  balanced: { label: "标准体积", plan: [1000, 4000, 8000, 16000, 32000] },
+  edge: { label: "摸边界体积", plan: [1000, 8000, 16000, 32000, 64000] },
+  expert: { label: "专家体积", plan: [1000, 8000, 16000, 32000, 64000, 128000] },
+};
+
+function formatCompactTokens(tokens) {
+  const num = Number(tokens || 0);
+  if (num >= 1000) return `${Math.round(num / 1000)}k`;
+  return String(num);
+}
+
+function updateRateLimitMode() {
+  const autoMode = ($("limitMode")?.value || "auto") === "auto";
+  document.querySelectorAll(".manual-field").forEach((el) => {
+    el.style.display = autoMode ? "none" : "grid";
+  });
+  if ($("limitProfile")) {
+    $("limitProfile").disabled = !autoMode;
+  }
+  const profile = $("limitProfile")?.value || "balanced";
+  const plan = autoRateLimitPlans[profile] || autoRateLimitPlans.balanced;
+  $("autoPlanHint").textContent = autoMode
+    ? `自动计划：${plan.plan.join(" -> ")}，最多 ${plan.total} 次`
+    : "手动计划：按你填写的轮数、总请求和最高并发执行";
+  $("rateLimitBtn").textContent = autoMode ? "开始自动探测" : "开始手动探测";
+}
+
+function updatePromptSizePlan() {
+  const profile = $("promptSizeProfile")?.value || "balanced";
+  const maxTokens = limitInputNumber("promptSizeMax", 32000);
+  const plan = promptSizePlans[profile] || promptSizePlans.balanced;
+  const capped = plan.plan.filter((tokens) => tokens <= maxTokens);
+  const effective = capped.length ? capped : [Math.min(maxTokens, plan.plan[0])];
+  $("promptSizePlanHint").textContent = `计划：${effective.map(formatCompactTokens).join(" -> ")}`;
+}
+
+function formatRateLimitReport(data) {
+  const summary = data.summary || {};
+  const settings = data.settings || {};
+  const rounds = data.rounds || [];
+  const lastGood = summary.last_fully_successful_round;
+  const firstBad = summary.first_failed_round;
+  let conclusion = "未触顶：本次计划全部成功，可以下次选择更高自动强度继续摸边界。";
+  if (firstBad) {
+    conclusion = `触到边界：上一轮可参考 ${lastGood ? `并发 ${lastGood.parallel}` : "无完整成功轮"}，失败轮是并发 ${firstBad.parallel}。`;
+  }
+  const lines = [
+    `结论: ${conclusion}`,
+    `停止原因: ${data.stop_reason || "unknown"}`,
+    `模型: ${data.model || ""} -> ${data.gemini_model || ""}`,
+    `模式: ${settings.auto_mode ? settings.auto_profile_label || settings.auto_profile : "手动挡"}`,
+    `计划: ${(settings.parallel_plan || []).join(" -> ")}`,
+    `总请求: ${summary.total_requests || 0}`,
+    `成功/失败: ${summary.successful_requests || 0}/${summary.failed_requests || 0}`,
+    `最高成功并发: ${summary.highest_successful_parallel || 0}`,
+    `最快成功 RPS: ${Number(summary.fastest_successful_rps || 0).toFixed(3)}`,
+    "",
+    "轮次明细:",
+  ];
+  for (const round of rounds) {
+    lines.push(
+      `第 ${round.round} 轮 | 并发 ${round.parallel} | 成功 ${round.successes} | 失败 ${round.failures} | 耗时 ${round.elapsed_seconds}s | 约 ${round.estimated_rps} req/s`
+    );
+    if (round.first_failure) {
+      lines.push(
+        `  首个错误: ${round.first_failure.category || "unknown"} ` +
+        `${round.first_failure.status_code || ""} ${round.first_failure.message || ""}`.trim()
+      );
+    }
+  }
+  if (summary.limit_signal) {
+    lines.push("", "边界信号:");
+    lines.push(JSON.stringify(summary.limit_signal, null, 2));
+  }
+  lines.push("", "完整 JSON:");
+  lines.push(JSON.stringify(data, null, 2));
+  return lines.join("\\n");
+}
+
+function formatPromptSizeReport(data) {
+  const summary = data.summary || {};
+  const settings = data.settings || {};
+  const steps = data.steps || [];
+  let conclusion = `未触顶：本次最大成功约 ${fmt.format(summary.largest_successful_prompt_tokens || 0)} tokens，约 ${fmt.format(summary.largest_successful_prompt_chars || 0)} 字符。`;
+  if (summary.limit_signal) {
+    conclusion = `触到边界：上一档最大成功约 ${fmt.format(summary.largest_successful_prompt_tokens || 0)} tokens；失败目标是 ${fmt.format(summary.first_failed_target_tokens || 0)} tokens。`;
+  }
+  const lines = [
+    `结论: ${conclusion}`,
+    `停止原因: ${data.stop_reason || "unknown"}`,
+    `模型: ${data.model || ""} -> ${data.gemini_model || ""}`,
+    `模式: ${settings.auto_profile_label || settings.auto_profile || ""}`,
+    `计划: ${(settings.target_plan || []).map(formatCompactTokens).join(" -> ")}`,
+    `成功/失败档位: ${summary.successful_steps || 0}/${summary.failed_steps || 0}`,
+    `最大成功 prompt: ${fmt.format(summary.largest_successful_prompt_tokens || 0)} tokens, ${fmt.format(summary.largest_successful_prompt_chars || 0)} 字符`,
+    "",
+    "档位明细:",
+  ];
+  for (const step of steps) {
+    lines.push(
+      `第 ${step.step} 档 | 目标 ${fmt.format(step.target_prompt_tokens || 0)} tokens | 估算 ${fmt.format(step.estimated_prompt_tokens || 0)} tokens | 字符 ${fmt.format(step.prompt_chars || 0)} | ${step.ok ? "成功" : "失败"} | 耗时 ${step.latency_seconds}s`
+    );
+    if (!step.ok) {
+      lines.push(
+        `  错误: ${step.category || "unknown"} ${step.status_code || ""} ${step.message || ""}`.trim()
+      );
+    }
+  }
+  if (summary.limit_signal) {
+    lines.push("", "边界信号:");
+    lines.push(JSON.stringify(summary.limit_signal, null, 2));
+  }
+  lines.push("", "完整 JSON:");
+  lines.push(JSON.stringify(data, null, 2));
+  return lines.join("\\n");
+}
+
+async function runRateLimitTest() {
+  const autoMode = ($("limitMode")?.value || "auto") === "auto";
+  const profile = $("limitProfile")?.value || "balanced";
+  const selectedPlan = autoRateLimitPlans[profile] || autoRateLimitPlans.balanced;
+  const confirmed = window.confirm(
+    autoMode
+      ? `自动限流探测会真实调用 Gemini，并计入本地用量统计。${selectedPlan.label} 将按 ${selectedPlan.plan.join(" -> ")} 并发逐步测试，最多 ${selectedPlan.total} 次请求，遇到错误会停止。确定开始吗？`
+      : "手动限流探测会真实调用 Gemini，并计入本地用量统计，遇到错误会停止。确定开始吗？"
+  );
+  if (!confirmed) return;
+
+  setBusy(true);
+  $("rateLimitOutput").textContent = autoMode
+    ? "正在进行自动限流探测，请不要重复点击..."
+    : "正在进行手动限流探测，请不要重复点击...";
+  try {
+    const payload = {
+      model: $("limitModel")?.value || "gemini-3-flash",
+      auto_mode: autoMode,
+      auto_profile: profile,
+      max_rounds: limitInputNumber("limitRounds", 4),
+      max_total_requests: limitInputNumber("limitTotal", 12),
+      max_parallel: limitInputNumber("limitParallel", 4),
+      base_delay_seconds: limitInputNumber("limitDelay", 2),
+      start_parallel: 1,
+      min_delay_seconds: 0.5,
+      per_request_timeout_seconds: 45,
+      stop_on_first_error: true,
+      prompt: "hi",
+    };
+    const data = await fetchJson("/admin/rate-limit-test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    $("rateLimitOutput").textContent = formatRateLimitReport(data);
+    await loadUsage();
+    await loadHealth();
+  } catch (error) {
+    $("rateLimitOutput").textContent = String(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function runPromptSizeTest() {
+  const profile = $("promptSizeProfile")?.value || "balanced";
+  const plan = promptSizePlans[profile] || promptSizePlans.balanced;
+  const maxTokens = limitInputNumber("promptSizeMax", 32000);
+  const capped = plan.plan.filter((tokens) => tokens <= maxTokens);
+  const effective = capped.length ? capped : [Math.min(maxTokens, plan.plan[0])];
+  const confirmed = window.confirm(
+    `Prompt 体积探测会真实调用 Gemini，并消耗大量输入 tokens。${plan.label} 将测试 ${effective.map(formatCompactTokens).join(" -> ")}。确定开始吗？`
+  );
+  if (!confirmed) return;
+
+  setBusy(true);
+  $("promptSizeOutput").textContent = "正在进行 Prompt 体积探测，请不要重复点击...";
+  try {
+    const payload = {
+      model: $("promptSizeModel")?.value || "gemini-3-flash",
+      auto_profile: profile,
+      max_target_tokens: maxTokens,
+      per_request_timeout_seconds: 180,
+      stop_on_first_error: true,
+    };
+    const data = await fetchJson("/admin/prompt-size-test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    $("promptSizeOutput").textContent = formatPromptSizeReport(data);
+    await loadUsage();
+    await loadHealth();
+  } catch (error) {
+    $("promptSizeOutput").textContent = String(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
 $("refreshPageBtn").addEventListener("click", refreshAll);
 $("refreshCookieBtn").addEventListener("click", refreshCookies);
 $("refreshCookieBtn2").addEventListener("click", refreshCookies);
 $("probeBtn").addEventListener("click", runProbe);
+$("rateLimitBtn").addEventListener("click", runRateLimitTest);
+$("limitMode").addEventListener("change", updateRateLimitMode);
+$("limitProfile").addEventListener("change", updateRateLimitMode);
+$("promptSizeBtn").addEventListener("click", runPromptSizeTest);
+$("promptSizeProfile").addEventListener("change", updatePromptSizePlan);
+$("promptSizeMax").addEventListener("input", updatePromptSizePlan);
 
+updateRateLimitMode();
+updatePromptSizePlan();
 refreshAll();
 setInterval(refreshAll, 30000);
 </script>
@@ -2693,6 +3593,10 @@ async def health(request: Request) -> dict[str, Any]:
         "cookie_writeback": {
             "enabled": _cookie_writeback_path() is not None,
             "interval_seconds": _cookie_writeback_interval_seconds(),
+        },
+        "cookie_refresh": _cookie_refresh_config(),
+        "prompt_budget": {
+            "max_prompt_tokens": _max_prompt_tokens(),
         },
     }
 
@@ -2725,6 +3629,78 @@ async def refresh_cookies_from_browser_endpoint(request: Request) -> JSONRespons
             f"Cookie refresh failed: {exc}",
             error_type=exc.__class__.__name__,
             code="cookie_refresh_failed",
+        )
+
+
+@app.post("/admin/rate-limit-test")
+async def rate_limit_test_endpoint(
+    payload: RateLimitTestRequest,
+    request: Request,
+) -> JSONResponse:
+    try:
+        _require_local_request(request)
+        client = _get_client(request)
+        result = await _run_rate_limit_probe(client, payload)
+        return JSONResponse(result)
+    except ValueError as exc:
+        logger.error("Invalid rate-limit probe request: %s", exc)
+        return _openai_error_response(
+            403,
+            str(exc),
+            error_type="forbidden",
+            code="local_only",
+        )
+    except AuthError as exc:
+        logger.error("Rate-limit probe blocked by Gemini auth failure.", exc_info=True)
+        return _openai_error_response(
+            500,
+            f"Gemini authentication failed: {exc}",
+            error_type="authentication_error",
+            code="gemini_auth_failed",
+        )
+    except Exception as exc:
+        logger.error("Rate-limit probe failed.", exc_info=True)
+        return _openai_error_response(
+            500,
+            f"Rate-limit probe failed: {exc}",
+            error_type=exc.__class__.__name__,
+            code="rate_limit_probe_failed",
+        )
+
+
+@app.post("/admin/prompt-size-test")
+async def prompt_size_test_endpoint(
+    payload: PromptSizeTestRequest,
+    request: Request,
+) -> JSONResponse:
+    try:
+        _require_local_request(request)
+        client = _get_client(request)
+        result = await _run_prompt_size_probe(client, payload)
+        return JSONResponse(result)
+    except ValueError as exc:
+        logger.error("Invalid prompt-size probe request: %s", exc)
+        return _openai_error_response(
+            403,
+            str(exc),
+            error_type="forbidden",
+            code="local_only",
+        )
+    except AuthError as exc:
+        logger.error("Prompt-size probe blocked by Gemini auth failure.", exc_info=True)
+        return _openai_error_response(
+            500,
+            f"Gemini authentication failed: {exc}",
+            error_type="authentication_error",
+            code="gemini_auth_failed",
+        )
+    except Exception as exc:
+        logger.error("Prompt-size probe failed.", exc_info=True)
+        return _openai_error_response(
+            500,
+            f"Prompt-size probe failed: {exc}",
+            error_type=exc.__class__.__name__,
+            code="prompt_size_probe_failed",
         )
 
 
@@ -3345,18 +4321,22 @@ async def chat_completions(
         client = _get_client(request)
         _ensure_client_authenticated(client)
         prompt = _messages_to_prompt(payload.messages)
+        prompt_tokens = _ensure_prompt_budget(prompt)
         _write_debug_prompt(prompt)
         gemini_model = _select_gemini_model(payload.model)
 
         logger.info(
             "Received chat completion: id=%s model=%s gemini_model=%s "
-            "stream=%s messages=%s prompt_chars=%s",
+            "stream=%s messages=%s prompt_chars=%s prompt_tokens=%s "
+            "max_prompt_tokens=%s",
             completion_id,
             payload.model,
             gemini_model,
             payload.stream,
             len(payload.messages),
             len(prompt),
+            prompt_tokens,
+            _max_prompt_tokens(),
         )
 
         if payload.temperature is not None:
