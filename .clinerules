@@ -5,7 +5,7 @@
 - This machine uses Windows PowerShell. Do not use `&&`; use `;` or separate command calls. Prefer `Set-Location "D:\GeminiAPI\Gemini-API"; command`.
 - Check PowerShell command success with `$LASTEXITCODE`. Do not claim success if visible output contains `fatal:`, `ParserError`, `InvalidEndOfLine`, or `^C`.
 - Treat the upstream Gemini-API core as read-only unless the user explicitly asks otherwise. Prefer adapter changes in `openai_adapter_server.py` and adapter helper files.
-- Keep Gemini adapter prompt input within the practical 32k-token working budget. The local probe found about 64k tokens can succeed but 128k fails, so use 32k as the safe Cline task limit.
+- Keep Gemini adapter prompt input within the practical 32k-token working budget. The adapter hard stop is 48k tokens, and the local probe found about 64k tokens can succeed but 128k fails.
 - Do not intentionally read or send full-project context, huge logs, generated files, caches, or repeated file contents when the task can be solved with targeted file reads.
 - For tasks that may exceed 32k prompt tokens, split the work into smaller phases, summarize findings, and continue with only the next relevant files.
 - If the user explicitly requests a larger-context experiment, warn that it may fail and ask before exceeding the 32k budget.
