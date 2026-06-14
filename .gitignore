@@ -209,6 +209,8 @@ cookies.json
 *.cookies
 gemini_cookies.local.json
 adapter_env.local.ps1
+.gemini_cookie_cache/
+.tmp_cookie_cache_probe/
 adapter_test_*.json
 adapter_forwarded_prompt.debug.txt
 adapter_usage*.jsonl

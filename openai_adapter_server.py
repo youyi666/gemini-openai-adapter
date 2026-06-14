@@ -14,10 +14,11 @@ import logging
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,7 +26,7 @@ from typing import Any, AsyncGenerator
 
 try:
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
     from pydantic import BaseModel, ConfigDict, Field
     from sse_starlette.sse import EventSourceResponse
 except ImportError as exc:  # pragma: no cover - startup dependency guard
@@ -41,7 +42,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from gemini_webapi import GeminiClient, set_log_level  # noqa: E402
-from gemini_webapi.constants import Model  # noqa: E402
+from gemini_webapi.constants import AccountStatus, Model  # noqa: E402
 from gemini_webapi.exceptions import (  # noqa: E402
     APIError,
     AuthError,
@@ -227,6 +228,8 @@ MODEL_PRICE_ALIASES = {
     "gemini-3-flash-thinking-advanced": "gemini-3.5-flash",
     "unspecified": "gemini-3.5-flash",
 }
+COOKIE_WRITEBACK_NAMES = ("__Secure-1PSID", "__Secure-1PSIDTS")
+COOKIE_REFRESH_NAMES = ("__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PSIDCC")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -293,6 +296,211 @@ def _load_cookies_json(path: str | os.PathLike[str]) -> dict[str, str]:
         raise ValueError(f"Unsupported or empty cookie JSON format: {cookie_path}")
 
     return cookies
+
+
+def _cookie_writeback_enabled() -> bool:
+    return _env_bool("OPENAI_ADAPTER_COOKIE_WRITEBACK", True)
+
+
+def _cookie_writeback_interval_seconds() -> int:
+    return max(30, _env_int("OPENAI_ADAPTER_COOKIE_WRITEBACK_INTERVAL_SECONDS", 60))
+
+
+def _cookie_writeback_path() -> Path | None:
+    if not _cookie_writeback_enabled():
+        return None
+
+    raw_path = os.getenv("GEMINI_COOKIES_JSON", "").strip()
+    if not raw_path:
+        return None
+
+    return Path(raw_path)
+
+
+def _extract_client_cookie_values(client: GeminiClient) -> dict[str, str]:
+    """Read refreshed auth cookie values from the live Gemini client."""
+
+    values: dict[str, str] = {}
+    cookies = getattr(client, "cookies", None)
+    cookie_jar = getattr(cookies, "jar", None)
+
+    if cookie_jar is not None:
+        for cookie in cookie_jar:
+            name = getattr(cookie, "name", "")
+            value = getattr(cookie, "value", "")
+            if name in COOKIE_WRITEBACK_NAMES and isinstance(value, str) and value:
+                values[name] = value
+
+    for name in COOKIE_WRITEBACK_NAMES:
+        if name in values or cookies is None:
+            continue
+        try:
+            value = cookies.get(name)
+        except Exception:
+            value = None
+        if isinstance(value, str) and value:
+            values[name] = value
+
+    return values
+
+
+def _cookie_object(name: str, value: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "value": value,
+        "domain": ".google.com",
+        "path": "/",
+    }
+
+
+def _merge_cookie_dict(target: dict[str, Any], values: dict[str, str]) -> bool:
+    changed = False
+    for name, value in values.items():
+        if target.get(name) != value:
+            target[name] = value
+            changed = True
+    return changed
+
+
+def _merge_cookie_list(target: list[Any], values: dict[str, str]) -> bool:
+    changed = False
+    seen: set[str] = set()
+
+    for item in target:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if name not in values:
+            continue
+        seen.add(name)
+        if item.get("value") != values[name]:
+            item["value"] = values[name]
+            changed = True
+
+    for name, value in values.items():
+        if name not in seen:
+            target.append(_cookie_object(name, value))
+            changed = True
+
+    return changed
+
+
+def _merge_cookie_values_into_json(
+    data: Any,
+    values: dict[str, str],
+) -> tuple[Any, bool]:
+    if isinstance(data, dict) and isinstance(data.get("cookies"), dict):
+        return data, _merge_cookie_dict(data["cookies"], values)
+
+    if isinstance(data, dict) and isinstance(data.get("cookies"), list):
+        return data, _merge_cookie_list(data["cookies"], values)
+
+    if isinstance(data, list):
+        return data, _merge_cookie_list(data, values)
+
+    if isinstance(data, dict):
+        return data, _merge_cookie_dict(data, values)
+
+    return dict(values), True
+
+
+def _write_cookie_values_to_json(path: Path, values: dict[str, str]) -> bool:
+    if not values:
+        return False
+
+    if not path.exists() and "__Secure-1PSID" not in values:
+        logger.warning(
+            "Skipping Gemini cookie writeback: %s does not exist and "
+            "__Secure-1PSID is unavailable.",
+            path,
+        )
+        return False
+
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        data = {}
+
+    merged, changed = _merge_cookie_values_into_json(data, values)
+    if not changed:
+        return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(
+        json.dumps(merged, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temp_path, path)
+    return True
+
+
+async def _write_client_cookies_back(
+    client: GeminiClient,
+    reason: str,
+) -> bool:
+    path = _cookie_writeback_path()
+    if path is None:
+        return False
+
+    status = _account_status_info(client)
+    if not status["authenticated"]:
+        logger.info(
+            "Skipping Gemini cookie writeback because account is not "
+            "authenticated: %s (%s). reason=%s",
+            status["name"],
+            status["value"],
+            reason,
+        )
+        return False
+
+    values = _extract_client_cookie_values(client)
+    try:
+        changed = _write_cookie_values_to_json(path, values)
+    except Exception:
+        logger.error(
+            "Failed to write refreshed Gemini cookies to %s (%s).",
+            path,
+            reason,
+            exc_info=True,
+        )
+        return False
+
+    if changed:
+        logger.info(
+            "Wrote refreshed Gemini cookies to %s (%s): %s",
+            path,
+            reason,
+            ", ".join(sorted(values)),
+        )
+    return changed
+
+
+async def _cookie_writeback_loop(client: GeminiClient) -> None:
+    interval = _cookie_writeback_interval_seconds()
+    logger.info("Gemini cookie writeback loop enabled: interval=%ss", interval)
+    while True:
+        await asyncio.sleep(interval)
+        await _write_client_cookies_back(client, "periodic")
+
+
+async def _start_cookie_writeback_task(app_: FastAPI, client: GeminiClient) -> None:
+    if _cookie_writeback_path() is None:
+        app_.state.cookie_writeback_task = None
+        return
+    app_.state.cookie_writeback_task = asyncio.create_task(
+        _cookie_writeback_loop(client)
+    )
+
+
+async def _cancel_cookie_writeback_task(app_: FastAPI) -> None:
+    task = getattr(app_.state, "cookie_writeback_task", None)
+    app_.state.cookie_writeback_task = None
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 async def _create_gemini_client() -> GeminiClient:
@@ -373,11 +581,18 @@ async def _create_gemini_client() -> GeminiClient:
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     _backfill_shared_usage_log()
+    app_.state.client_reload_lock = asyncio.Lock()
     client = await _create_gemini_client()
     app_.state.gemini_client = client
+
+    await _write_client_cookies_back(client, "startup")
+    await _start_cookie_writeback_task(app_, client)
+
     try:
         yield
     finally:
+        await _cancel_cookie_writeback_task(app_)
+        await _write_client_cookies_back(client, "shutdown-before-close")
         logger.info("Closing Gemini client.")
         await client.close()
 
@@ -390,6 +605,187 @@ def _get_client(request: Request) -> GeminiClient:
     if client is None:
         raise RuntimeError("Gemini client is not initialized.")
     return client
+
+
+def _account_status_info(client: GeminiClient) -> dict[str, Any]:
+    status = getattr(client, "account_status", None)
+    name = getattr(status, "name", str(status) if status is not None else "UNKNOWN")
+    value = int(status) if isinstance(status, int) else None
+    description = getattr(status, "description", "")
+    return {
+        "name": name,
+        "value": value,
+        "description": description,
+        "authenticated": status in {None, AccountStatus.AVAILABLE},
+    }
+
+
+def _auth_failure_message(client: GeminiClient | None = None) -> str:
+    if client is not None:
+        status = _account_status_info(client)
+        if not status["authenticated"]:
+            return (
+                "Gemini session is not authenticated. "
+                f"account_status={status['name']} ({status['value']}): "
+                f"{status['description']} "
+                "Please refresh gemini_cookies.local.json and restart the adapter."
+            )
+    return (
+        "Gemini session is not authenticated or cookies have expired. "
+        "Please refresh gemini_cookies.local.json and restart the adapter."
+    )
+
+
+def _ensure_client_authenticated(client: GeminiClient) -> None:
+    if not _account_status_info(client)["authenticated"]:
+        raise AuthError(_auth_failure_message(client))
+
+
+def _looks_like_auth_failure(exc: BaseException, client: GeminiClient | None = None) -> bool:
+    if client is not None and not _account_status_info(client)["authenticated"]:
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "status: 405",
+            "unauthenticated",
+            "not authenticated",
+            "cookies have expired",
+            "authentication",
+        )
+    )
+
+
+def _require_local_request(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise ValueError("Cookie management endpoints are local-only.")
+
+
+def _reset_gemini_cookie_cache() -> dict[str, Any]:
+    raw_path = os.getenv("GEMINI_COOKIE_PATH", "").strip()
+    if not raw_path:
+        return {"enabled": False, "path": None, "cleared": False}
+
+    cache_path = Path(raw_path)
+    try:
+        if cache_path.exists():
+            for item in cache_path.iterdir():
+                if item.is_dir():
+                    import shutil
+
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+        cache_path.mkdir(parents=True, exist_ok=True)
+        logger.info("Cleared Gemini cookie cache: %s", cache_path)
+        return {"enabled": True, "path": str(cache_path), "cleared": True}
+    except OSError as exc:
+        logger.error("Failed to clear Gemini cookie cache: %s", cache_path, exc_info=True)
+        return {
+            "enabled": True,
+            "path": str(cache_path),
+            "cleared": False,
+            "error": str(exc),
+        }
+
+
+def _cookie_refresh_report_from_file(path: Path, source_hint: str | None = None) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    source = source_hint
+    cookies: dict[str, str] = {}
+
+    if isinstance(data, dict):
+        if isinstance(data.get("source"), str):
+            source = data["source"]
+        if isinstance(data.get("cookies"), dict):
+            cookies = {
+                name: value
+                for name, value in data["cookies"].items()
+                if isinstance(name, str) and isinstance(value, str)
+            }
+        elif all(isinstance(key, str) and isinstance(value, str) for key, value in data.items()):
+            cookies = data
+
+    return {
+        "path": str(path),
+        "source": source or "unknown",
+        "cookies": [
+            {
+                "name": name,
+                "present": bool(cookies.get(name)),
+                "length": len(cookies.get(name, "")),
+            }
+            for name in COOKIE_REFRESH_NAMES
+        ],
+    }
+
+
+def _run_cookie_refresh_script(cookie_path: Path) -> dict[str, Any]:
+    script_path = ROOT / "refresh_gemini_cookies_from_browser.py"
+    result = subprocess.run(
+        [sys.executable, str(script_path), str(cookie_path)],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    if result.returncode != 0:
+        detail = (result.stdout + "\n" + result.stderr).strip()
+        raise RuntimeError(detail or f"Cookie refresh script exited with {result.returncode}.")
+    logger.info("Cookie refresh script completed: %s", result.stdout.strip())
+    return _cookie_refresh_report_from_file(cookie_path)
+
+
+async def _refresh_cookies_and_reload_client(request: Request) -> dict[str, Any]:
+    _require_local_request(request)
+
+    lock = getattr(request.app.state, "client_reload_lock", None)
+    if lock is None:
+        request.app.state.client_reload_lock = asyncio.Lock()
+        lock = request.app.state.client_reload_lock
+
+    async with lock:
+        cookie_path = _cookie_writeback_path()
+        if cookie_path is None:
+            raise RuntimeError("GEMINI_COOKIES_JSON is not configured.")
+
+        old_client = _get_client(request)
+        old_status = _account_status_info(old_client)
+
+        await _cancel_cookie_writeback_task(request.app)
+        refresh_report = await asyncio.to_thread(_run_cookie_refresh_script, cookie_path)
+        cache_report = _reset_gemini_cookie_cache()
+
+        new_client = await _create_gemini_client()
+        new_status = _account_status_info(new_client)
+        if not new_status["authenticated"]:
+            await new_client.close()
+            await _start_cookie_writeback_task(request.app, old_client)
+            raise AuthError(_auth_failure_message(new_client))
+
+        request.app.state.gemini_client = new_client
+        await _write_client_cookies_back(new_client, "manual-refresh")
+        await _start_cookie_writeback_task(request.app, new_client)
+
+        logger.info(
+            "Reloaded Gemini client after browser cookie refresh: old_status=%s "
+            "new_status=%s source=%s",
+            old_status["name"],
+            new_status["name"],
+            refresh_report.get("source"),
+        )
+        with suppress(Exception):
+            await old_client.close()
+
+        return {
+            "ok": True,
+            "old_account_status": old_status,
+            "account_status": new_status,
+            "cookie_refresh": refresh_report,
+            "cookie_cache": cache_report,
+        }
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -1336,7 +1732,11 @@ async def _prime_gemini_stream(
     headers, so clients can still receive an HTTP 500 JSON error.
     """
 
-    upstream = client.generate_content_stream(prompt, model=gemini_model)
+    upstream = client.generate_content_stream(
+        prompt,
+        model=gemini_model,
+        current_retry=_upstream_retry_count(),
+    )
     buffered: list[str] = []
 
     while True:
@@ -1352,6 +1752,7 @@ async def _prime_gemini_stream(
 
 
 async def _openai_sse_events(
+    client: GeminiClient,
     upstream: AsyncGenerator[Any, None],
     buffered_deltas: list[str],
     completion_id: str,
@@ -1419,6 +1820,7 @@ async def _openai_sse_events(
             usage,
             cost_estimate,
         )
+        await _write_client_cookies_back(client, "stream-response")
         finish_payload = _stream_chunk_payload(
             completion_id,
             openai_model,
@@ -1441,8 +1843,133 @@ async def _openai_sse_events(
     except asyncio.CancelledError:
         logger.info("Streaming response cancelled by client: id=%s", completion_id)
         raise
-    except (AuthError, APIError, GeminiError, GeminiTimeoutError) as exc:
+    except AuthError as exc:
         logger.error("Gemini streaming error: id=%s", completion_id, exc_info=True)
+        yield {
+            "data": _json_dumps(
+                {
+                    "error": {
+                        "message": str(exc),
+                        "type": exc.__class__.__name__,
+                        "param": None,
+                        "code": "gemini_stream_error",
+                    }
+                }
+            )
+        }
+        yield {"data": "[DONE]"}
+    except (APIError, GeminiError, GeminiTimeoutError) as exc:
+        logger.error("Gemini streaming error: id=%s", completion_id, exc_info=True)
+        if _looks_like_auth_failure(exc, client):
+            yield {
+                "data": _json_dumps(
+                    {
+                        "error": {
+                            "message": _auth_failure_message(client),
+                            "type": "authentication_error",
+                            "param": None,
+                            "code": "gemini_auth_failed",
+                        }
+                    }
+                )
+            }
+            yield {"data": "[DONE]"}
+            return
+
+        fallback_model = _stream_fallback_model(gemini_model)
+        if _stream_fallback_enabled() and not completion_parts and fallback_model:
+            logger.info(
+                "Trying fallback generation after stream failure: id=%s "
+                "fallback_model=%s",
+                completion_id,
+                fallback_model,
+            )
+            try:
+                fallback_output = await client.generate_content(
+                    prompt,
+                    model=fallback_model,
+                    current_retry=_upstream_retry_count(),
+                )
+                fallback_text = getattr(fallback_output, "text", "") or ""
+                if fallback_text:
+                    usage, cost_estimate = _build_usage(
+                        fallback_model,
+                        prompt,
+                        fallback_text,
+                    )
+                    _record_usage(
+                        completion_id,
+                        openai_model,
+                        fallback_model,
+                        True,
+                        usage,
+                        cost_estimate,
+                    )
+                    await _write_client_cookies_back(
+                        client,
+                        "stream-fallback-response",
+                    )
+                    yield {
+                        "data": _json_dumps(
+                            _stream_chunk_payload(
+                                completion_id,
+                                openai_model,
+                                created,
+                                {"content": fallback_text},
+                            )
+                        )
+                    }
+                    finish_payload = _stream_chunk_payload(
+                        completion_id,
+                        openai_model,
+                        created,
+                        {},
+                        finish_reason="stop",
+                    )
+                    finish_payload["usage"] = usage
+                    finish_payload["cost_estimate"] = cost_estimate
+                    finish_payload["fallback"] = {
+                        "reason": "stream_error_before_text",
+                        "original_gemini_model": gemini_model,
+                        "fallback_gemini_model": fallback_model,
+                    }
+                    yield {"data": _json_dumps(finish_payload)}
+                    yield {"data": "[DONE]"}
+                    logger.info(
+                        "Completed fallback response: id=%s fallback_model=%s "
+                        "chars=%s",
+                        completion_id,
+                        fallback_model,
+                        len(fallback_text),
+                    )
+                    return
+            except Exception as fallback_exc:
+                logger.error(
+                    "Fallback generation failed after stream error: id=%s "
+                    "fallback_model=%s",
+                    completion_id,
+                    fallback_model,
+                    exc_info=True,
+                )
+                if _looks_like_auth_failure(fallback_exc, client):
+                    yield {
+                        "data": _json_dumps(
+                            {
+                                "error": {
+                                    "message": _auth_failure_message(client),
+                                    "type": "authentication_error",
+                                    "param": None,
+                                    "code": "gemini_auth_failed",
+                                }
+                            }
+                        )
+                    }
+                    yield {"data": "[DONE]"}
+                    return
+                exc = GeminiError(
+                    f"{exc} Fallback model {fallback_model!r} also failed: "
+                    f"{fallback_exc}"
+                )
         yield {
             "data": _json_dumps(
                 {
@@ -1477,13 +2004,914 @@ async def _openai_sse_events(
             await close()
 
 
+def _stream_eager_enabled() -> bool:
+    return _env_bool("OPENAI_ADAPTER_STREAM_EAGER", True)
+
+
+def _stream_fallback_enabled() -> bool:
+    return _env_bool("OPENAI_ADAPTER_STREAM_FALLBACK_NON_STREAM", True)
+
+
+def _stream_fallback_model(current_model: str) -> str | None:
+    fallback = os.getenv("OPENAI_ADAPTER_STREAM_FALLBACK_MODEL", "gemini-3-flash")
+    fallback = fallback.strip()
+    if not fallback or fallback.lower() in {"0", "false", "none", "off"}:
+        return None
+    if fallback == current_model:
+        return None
+    return fallback
+
+
+def _stream_ping_seconds() -> int:
+    return max(1, _env_int("OPENAI_ADAPTER_STREAM_PING_SECONDS", 15))
+
+
+def _upstream_retry_count() -> int:
+    return max(0, _env_int("OPENAI_ADAPTER_UPSTREAM_RETRIES", 0))
+
+
+def _adapter_console_html() -> str:
+    body = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemini OpenAI 适配器控制台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --panel-soft: #f8fafc;
+      --text: #172033;
+      --muted: #64748b;
+      --line: #d7dde8;
+      --blue: #155eef;
+      --blue-soft: #eaf1ff;
+      --green: #16803c;
+      --red: #b42318;
+      --amber: #a15c07;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 22px 16px 42px;
+    }
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 16px;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 26px;
+      line-height: 1.25;
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 18px;
+      line-height: 1.3;
+    }
+    h3 {
+      margin: 16px 0 8px;
+      font-size: 15px;
+    }
+    p { margin: 0; }
+    a { color: var(--blue); text-decoration: none; }
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      word-break: break-all;
+    }
+    .muted {
+      color: var(--muted);
+      line-height: 1.65;
+    }
+    .top-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .btn {
+      appearance: none;
+      border: 1px solid var(--blue);
+      background: var(--blue);
+      color: #fff;
+      border-radius: 7px;
+      padding: 9px 12px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      min-height: 38px;
+    }
+    .btn.secondary {
+      background: #fff;
+      color: var(--blue);
+    }
+    .btn:disabled {
+      opacity: 0.62;
+      cursor: wait;
+    }
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 14px 0 18px;
+    }
+    .nav a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--text);
+      font-size: 13px;
+    }
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      margin: 14px 0;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 10px;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--panel-soft);
+      min-width: 0;
+    }
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+    .value {
+      font-weight: 800;
+      font-size: 20px;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .value.small { font-size: 14px; font-weight: 700; }
+    .ok { color: var(--green); }
+    .bad { color: var(--red); }
+    .warn { color: var(--amber); }
+    .split {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+      gap: 12px;
+    }
+    .status-line {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-top: 10px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel-soft);
+      font-size: 13px;
+    }
+    .pill.ok { border-color: #a7e0b8; background: #edfdf3; }
+    .pill.bad { border-color: #f3b1aa; background: #fff1f0; }
+    .output {
+      width: 100%;
+      min-height: 150px;
+      margin: 0;
+      padding: 12px;
+      border-radius: 8px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #101828;
+      color: #eef4ff;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .quick-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    .quick-table th,
+    .quick-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 4px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .quick-table th {
+      color: var(--muted);
+      font-weight: 700;
+      width: 120px;
+    }
+    .calendar-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      margin-top: 12px;
+      overflow-x: auto;
+      background: var(--panel-soft);
+    }
+    .heatmap {
+      width: max-content;
+      min-width: 100%;
+    }
+    .month-row {
+      display: grid;
+      gap: 3px;
+      margin-left: 24px;
+      margin-bottom: 5px;
+      min-height: 16px;
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .month-label {
+      min-width: 30px;
+      overflow: visible;
+    }
+    .heatmap-body {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+    }
+    .weekday-labels {
+      display: grid;
+      grid-template-rows: repeat(7, 12px);
+      gap: 3px;
+      width: 18px;
+      font-size: 11px;
+      line-height: 12px;
+      color: var(--muted);
+      text-align: right;
+    }
+    .calendar {
+      display: grid;
+      grid-auto-flow: column;
+      grid-template-rows: repeat(7, 12px);
+      gap: 3px;
+      min-height: 102px;
+      width: max-content;
+    }
+    .day {
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      background: #ebedf0;
+      box-shadow: inset 0 0 0 1px rgba(27, 31, 35, 0.06);
+    }
+    .day.out { visibility: hidden; }
+    .day.today {
+      outline: 2px solid #111827;
+      outline-offset: 1px;
+    }
+    .level-1 { background: #9be9a8; }
+    .level-2 { background: #40c463; }
+    .level-3 { background: #30a14e; }
+    .level-4 { background: #216e39; }
+    .legend {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .legend .day { display: inline-block; }
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    table.data {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 680px;
+      font-size: 13px;
+    }
+    table.data th,
+    table.data td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    table.data th {
+      background: var(--panel-soft);
+      color: #334155;
+      font-weight: 800;
+    }
+    table.data tr:last-child td { border-bottom: 0; }
+    .models {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+    }
+    @media (max-width: 780px) {
+      header,
+      .split {
+        grid-template-columns: 1fr;
+        display: block;
+      }
+      .top-actions {
+        justify-content: flex-start;
+        margin-top: 12px;
+      }
+      main { padding: 18px 12px 34px; }
+      .section { padding: 13px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Gemini OpenAI 适配器控制台</h1>
+      <p class="muted">以后只记这个入口：<code>http://127.0.0.1:8000/</code>。这里集中管理状态、Cookie、用量、模型和快速测试。</p>
+    </div>
+    <div class="top-actions">
+      <button id="refreshPageBtn" class="btn secondary" type="button">刷新状态</button>
+      <button id="refreshCookieBtn" class="btn" type="button">刷新 Cookie</button>
+    </div>
+  </header>
+
+  <nav class="nav" aria-label="控制台导航">
+    <a href="#status">服务状态</a>
+    <a href="#cookies">Cookie</a>
+    <a href="#usage">用量热力图</a>
+    <a href="#models">模型</a>
+    <a href="#test">快速测试</a>
+    <a href="#config">Cline 配置</a>
+  </nav>
+
+  <section id="status" class="section">
+    <h2>服务状态</h2>
+    <div id="statusCards" class="grid"></div>
+    <div id="statusLine" class="status-line"></div>
+  </section>
+
+  <section id="cookies" class="section">
+    <div class="split">
+      <div>
+        <h2>Cookie 管理</h2>
+        <p class="muted">点击按钮会从本机 Chrome / Edge 读取 Gemini 登录 Cookie，清理本项目 Cookie 缓存，并热重载 Gemini 客户端。页面只显示 Cookie 是否存在和长度，不显示真实值。</p>
+        <div class="status-line">
+          <button id="refreshCookieBtn2" class="btn" type="button">刷新 Cookie 并重载客户端</button>
+          <a class="pill" href="/health" target="_blank" rel="noreferrer">查看 /health JSON</a>
+        </div>
+      </div>
+      <pre id="cookieOutput" class="output">等待操作。</pre>
+    </div>
+  </section>
+
+  <section id="usage" class="section">
+    <h2>用量统计</h2>
+    <p class="muted" id="usageNote">读取中...</p>
+    <div id="usageCards" class="grid"></div>
+    <div class="calendar-wrap">
+      <div class="heatmap">
+        <div id="monthRow" class="month-row" aria-hidden="true"></div>
+        <div class="heatmap-body">
+          <div class="weekday-labels" aria-hidden="true">
+            <span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span>
+          </div>
+          <div id="calendar" class="calendar" aria-label="每日用量热力图"></div>
+        </div>
+      </div>
+      <div id="legend" class="legend"></div>
+    </div>
+
+    <h3>按模型统计</h3>
+    <div class="table-wrap"><table class="data"><thead><tr><th>模型</th><th>请求</th><th>输入 Tokens</th><th>输出 Tokens</th><th>总 Tokens</th><th>美元</th><th>人民币</th></tr></thead><tbody id="modelRows"></tbody></table></div>
+
+    <h3>按电脑统计</h3>
+    <div class="table-wrap"><table class="data"><thead><tr><th>电脑</th><th>请求</th><th>输入 Tokens</th><th>输出 Tokens</th><th>总 Tokens</th><th>美元</th><th>人民币</th></tr></thead><tbody id="instanceRows"></tbody></table></div>
+
+    <h3>最近请求</h3>
+    <div class="table-wrap"><table class="data"><thead><tr><th>时间</th><th>电脑</th><th>请求模型</th><th>实际模型</th><th>流式</th><th>Tokens</th><th>人民币</th></tr></thead><tbody id="recentRows"></tbody></table></div>
+
+    <h3>数据来源</h3>
+    <div class="table-wrap"><table class="data"><thead><tr><th>文件</th><th>存在</th><th>有效记录</th><th>无效行</th></tr></thead><tbody id="sourceRows"></tbody></table></div>
+  </section>
+
+  <section id="models" class="section">
+    <h2>可用模型</h2>
+    <div id="modelList" class="models"></div>
+  </section>
+
+  <section id="test" class="section">
+    <div class="split">
+      <div>
+        <h2>快速测试</h2>
+        <p class="muted">只在你点击时发送一次最小请求，用来确认 Cline/Continue 使用同一个 OpenAI 兼容接口能够收到回答。</p>
+        <div class="status-line">
+          <button id="probeBtn" class="btn secondary" type="button">发送一句测试</button>
+        </div>
+      </div>
+      <pre id="probeOutput" class="output">尚未测试。</pre>
+    </div>
+  </section>
+
+  <section id="config" class="section">
+    <h2>Cline / Continue 配置速查</h2>
+    <table class="quick-table">
+      <tbody>
+        <tr><th>Base URL</th><td><code>http://127.0.0.1:8000/v1</code></td></tr>
+        <tr><th>API Key</th><td><code>dummy</code> 或任意非空字符串</td></tr>
+        <tr><th>稳妥模型</th><td><code>gemini-3-flash</code></td></tr>
+        <tr><th>更强模型</th><td><code>gemini-3-pro</code>，复杂任务建议拆小一点，遇到 429 先切回 Flash</td></tr>
+        <tr><th>健康检查</th><td><code>Invoke-RestMethod http://127.0.0.1:8000/health | ConvertTo-Json -Depth 5</code></td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const pricingSourceUrl = "__PRICING_SOURCE_URL__";
+const $ = (id) => document.getElementById(id);
+const fmt = new Intl.NumberFormat("zh-CN");
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function money(value, prefix) {
+  const num = Number(value || 0);
+  return `${prefix}${num.toFixed(6)}`;
+}
+
+function setBusy(isBusy) {
+  ["refreshPageBtn", "refreshCookieBtn", "refreshCookieBtn2", "probeBtn"].forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = isBusy;
+  });
+}
+
+async function fetchJson(url, options) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+  if (!response.ok) {
+    const message = data?.error?.message || data?.detail || text || response.statusText;
+    throw new Error(`${response.status} ${message}`);
+  }
+  return data;
+}
+
+function metric(label, value, className = "") {
+  return `<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value ${className}">${escapeHtml(value)}</div></div>`;
+}
+
+function metricHtml(label, valueHtml, className = "") {
+  return `<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value ${className}">${valueHtml}</div></div>`;
+}
+
+async function loadHealth() {
+  const data = await fetchJson("/health");
+  const status = data.account_status || {};
+  const authClass = status.authenticated ? "ok" : "bad";
+  $("statusCards").innerHTML = [
+    metric("服务", data.status || "unknown", data.status === "ok" ? "ok" : "bad"),
+    metric("Gemini 客户端", data.gemini_client || "unknown", data.gemini_client === "initialized" ? "ok" : "bad"),
+    metric("账号状态", status.name || "UNKNOWN", authClass),
+    metric("已认证", status.authenticated ? "true" : "false", authClass),
+    metric("Cookie 写回", data.cookie_writeback?.enabled ? "已启用" : "未启用", data.cookie_writeback?.enabled ? "ok" : "warn"),
+    metric("写回间隔", `${data.cookie_writeback?.interval_seconds ?? "-"} 秒`),
+  ].join("");
+  $("statusLine").innerHTML = `
+    <span class="pill ${status.authenticated ? "ok" : "bad"}">${escapeHtml(status.description || "无状态说明")}</span>
+    <span class="pill">页面每 30 秒自动刷新数据</span>
+  `;
+}
+
+function renderRows(targetId, rows, emptyText) {
+  $(targetId).innerHTML = rows.length ? rows.join("") : `<tr><td colspan="7" class="muted">${escapeHtml(emptyText)}</td></tr>`;
+}
+
+function summaryRow(name, values) {
+  return `<tr>
+    <td>${escapeHtml(name)}</td>
+    <td>${fmt.format(values.requests || 0)}</td>
+    <td>${fmt.format(values.prompt_tokens || 0)}</td>
+    <td>${fmt.format(values.completion_tokens || 0)}</td>
+    <td>${fmt.format(values.total_tokens || 0)}</td>
+    <td>${money(values.cost_usd, "$")}</td>
+    <td>${money(values.cost_cny, "¥")}</td>
+  </tr>`;
+}
+
+function renderHeatmap(daily) {
+  const cells = daily?.cells || [];
+  const weekCount = Math.max(1, Math.ceil(cells.length / 7));
+  const labels = [];
+  for (let weekIndex = 0; weekIndex < weekCount; weekIndex += 1) {
+    const week = cells.slice(weekIndex * 7, weekIndex * 7 + 7);
+    const monthStart = week.find((cell) => cell.in_range && String(cell.date || "").endsWith("-01"));
+    labels.push(monthStart ? `${Number(String(monthStart.date).slice(5, 7))}月` : "");
+  }
+  $("monthRow").style.gridTemplateColumns = `repeat(${weekCount}, 12px)`;
+  $("monthRow").innerHTML = labels.map((label) => `<span class="month-label">${escapeHtml(label)}</span>`).join("");
+  $("calendar").innerHTML = cells.map((cell) => {
+    const title = `${cell.date}: ${cell.requests || 0} 次请求，${fmt.format(cell.total_tokens || 0)} tokens，约 ¥${Number(cell.cost_cny || 0).toFixed(6)}`;
+    const classes = ["day", `level-${cell.level || 0}`];
+    if (!cell.in_range) classes.push("out");
+    if (cell.is_today) classes.push("today");
+    return `<span class="${classes.join(" ")}" title="${escapeHtml(title)}"></span>`;
+  }).join("");
+  $("legend").innerHTML = `
+    <span>少</span>
+    <span class="day level-0"></span>
+    <span class="day level-1"></span>
+    <span class="day level-2"></span>
+    <span class="day level-3"></span>
+    <span class="day level-4"></span>
+    <span>多</span>
+    <span>最高单日 ${fmt.format(daily?.max_daily_tokens || 0)} tokens</span>
+    <span>黑框是今天 ${escapeHtml(daily?.today || "")}</span>
+  `;
+}
+
+async function loadUsage() {
+  const data = await fetchJson("/usage?limit=20");
+  const totals = data.totals || {};
+  $("usageNote").innerHTML = `本页按 Google Gemini API 官方付费档做本地估算，不是 Gemini 网页版真实账单。价格来源：<a href="${escapeHtml(data.pricing_source || pricingSourceUrl)}" target="_blank" rel="noreferrer">官方价格页</a>`;
+  $("usageCards").innerHTML = [
+    metric("请求次数", fmt.format(totals.requests || 0)),
+    metric("总 Tokens", fmt.format(totals.total_tokens || 0)),
+    metric("估算美元", money(totals.cost_usd, "$")),
+    metric("估算人民币", money(totals.cost_cny, "¥")),
+    metric("电脑数量", fmt.format(Object.keys(data.by_instance || {}).length)),
+    metricHtml("共享目录", `<code>${escapeHtml(data.shared_usage_dir || "未启用")}</code>`, "small"),
+  ].join("");
+  renderHeatmap(data.daily || {});
+
+  renderRows(
+    "modelRows",
+    Object.entries(data.by_model || {}).map(([name, values]) => summaryRow(name, values)),
+    "暂无模型用量记录。"
+  );
+  renderRows(
+    "instanceRows",
+    Object.entries(data.by_instance || {}).map(([name, values]) => summaryRow(name, values)),
+    "暂无电脑用量记录。"
+  );
+  $("recentRows").innerHTML = (data.recent || []).slice().reverse().map((record) => {
+    const usage = record.usage || {};
+    const cost = record.cost_estimate || {};
+    return `<tr>
+      <td>${escapeHtml(record.timestamp || "")}</td>
+      <td>${escapeHtml(record.instance_id || record.host || "unknown")}</td>
+      <td>${escapeHtml(record.requested_model || "")}</td>
+      <td>${escapeHtml(record.gemini_model || "")}</td>
+      <td>${record.stream ? "是" : "否"}</td>
+      <td>${fmt.format(usage.total_tokens || 0)}</td>
+      <td>${money(cost.total_cost_cny, "¥")}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted">暂无最近请求。</td></tr>`;
+  $("sourceRows").innerHTML = (data.usage_sources || []).map((source) => `<tr>
+    <td><code>${escapeHtml(source.path || "")}</code></td>
+    <td>${source.exists ? "是" : "否"}</td>
+    <td>${fmt.format(source.records || 0)}</td>
+    <td>${fmt.format(source.invalid_lines || 0)}</td>
+  </tr>`).join("") || `<tr><td colspan="4" class="muted">暂无数据来源。</td></tr>`;
+}
+
+async function loadModels() {
+  const data = await fetchJson("/v1/models");
+  const models = data.data || [];
+  $("modelList").innerHTML = models.length
+    ? models.map((model) => `<span class="pill">${escapeHtml(model.id)}</span>`).join("")
+    : `<span class="muted">暂无模型列表。</span>`;
+}
+
+async function refreshAll() {
+  await Promise.allSettled([loadHealth(), loadUsage(), loadModels()]);
+}
+
+async function refreshCookies() {
+  setBusy(true);
+  $("cookieOutput").textContent = "正在刷新 Cookie、清理缓存并重载 Gemini 客户端...";
+  try {
+    const data = await fetchJson("/admin/refresh-cookies", { method: "POST" });
+    $("cookieOutput").textContent = JSON.stringify(data, null, 2);
+    await refreshAll();
+  } catch (error) {
+    $("cookieOutput").textContent = String(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function runProbe() {
+  setBusy(true);
+  $("probeOutput").textContent = "正在发送测试请求...";
+  try {
+    const data = await fetchJson("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gemini-3-flash",
+        stream: false,
+        messages: [{ role: "user", content: "用一句话回复：adapter 正常。" }],
+      }),
+    });
+    $("probeOutput").textContent = JSON.stringify(data, null, 2);
+    await loadUsage();
+  } catch (error) {
+    $("probeOutput").textContent = String(error);
+  } finally {
+    setBusy(false);
+  }
+}
+
+$("refreshPageBtn").addEventListener("click", refreshAll);
+$("refreshCookieBtn").addEventListener("click", refreshCookies);
+$("refreshCookieBtn2").addEventListener("click", refreshCookies);
+$("probeBtn").addEventListener("click", runProbe);
+
+refreshAll();
+setInterval(refreshAll, 30000);
+</script>
+</body>
+</html>"""
+    return body.replace("__PRICING_SOURCE_URL__", html.escape(PRICING_SOURCE_URL, quote=True))
+
+
+@app.get("/", response_class=HTMLResponse)
+async def adapter_console() -> HTMLResponse:
+    return HTMLResponse(_adapter_console_html())
+
+
+@app.get("/dashboard.html", response_class=HTMLResponse)
+async def adapter_console_alias() -> HTMLResponse:
+    return HTMLResponse(_adapter_console_html())
+
+
 @app.get("/health")
 async def health(request: Request) -> dict[str, Any]:
     client = _get_client(request)
     return {
         "status": "ok",
         "gemini_client": "initialized" if client else "missing",
+        "account_status": _account_status_info(client),
+        "cookie_writeback": {
+            "enabled": _cookie_writeback_path() is not None,
+            "interval_seconds": _cookie_writeback_interval_seconds(),
+        },
     }
+
+
+@app.post("/admin/refresh-cookies")
+async def refresh_cookies_from_browser_endpoint(request: Request) -> JSONResponse:
+    try:
+        result = await _refresh_cookies_and_reload_client(request)
+        return JSONResponse(result)
+    except ValueError as exc:
+        logger.error("Invalid cookie refresh request: %s", exc)
+        return _openai_error_response(
+            403,
+            str(exc),
+            error_type="forbidden",
+            code="local_only",
+        )
+    except AuthError as exc:
+        logger.error("Cookie refresh produced unauthenticated Gemini client.", exc_info=True)
+        return _openai_error_response(
+            500,
+            f"Cookie refresh failed authentication: {exc}",
+            error_type="authentication_error",
+            code="gemini_auth_failed",
+        )
+    except Exception as exc:
+        logger.error("Cookie refresh failed.", exc_info=True)
+        return _openai_error_response(
+            500,
+            f"Cookie refresh failed: {exc}",
+            error_type=exc.__class__.__name__,
+            code="cookie_refresh_failed",
+        )
+
+
+@app.get("/cookie.html", response_class=HTMLResponse)
+async def cookie_dashboard(request: Request) -> HTMLResponse:
+    return RedirectResponse(url="/#cookies", status_code=307)
+    client = _get_client(request)
+    account_status = _account_status_info(client)
+    cookie_path = _cookie_writeback_path()
+    cache_path = os.getenv("GEMINI_COOKIE_PATH", "").strip()
+    body = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemini Cookie 管理</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --ok: #16803c;
+      --bad: #b42318;
+      --line: #d7dde5;
+      --soft: #f6f8fb;
+      --text: #172033;
+      --muted: #5d6b82;
+    }}
+    body {{
+      margin: 0;
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      color: var(--text);
+      background: #ffffff;
+    }}
+    main {{
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 28px 18px 48px;
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 26px;
+    }}
+    h2 {{
+      margin-top: 26px;
+      font-size: 18px;
+    }}
+    .muted {{
+      color: var(--muted);
+      line-height: 1.7;
+    }}
+    .panel {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      background: var(--soft);
+      margin-top: 16px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+    }}
+    .metric {{
+      background: #ffffff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }}
+    .label {{
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 6px;
+    }}
+    .value {{
+      font-size: 16px;
+      font-weight: 700;
+      word-break: break-word;
+    }}
+    .ok {{ color: var(--ok); }}
+    .bad {{ color: var(--bad); }}
+    button {{
+      appearance: none;
+      border: 1px solid #0f5bd7;
+      background: #0f5bd7;
+      color: #fff;
+      border-radius: 7px;
+      font-size: 15px;
+      font-weight: 700;
+      padding: 10px 14px;
+      cursor: pointer;
+    }}
+    button:disabled {{
+      opacity: 0.65;
+      cursor: wait;
+    }}
+    pre {{
+      background: #101828;
+      color: #eef4ff;
+      padding: 14px;
+      border-radius: 8px;
+      overflow: auto;
+      min-height: 80px;
+      white-space: pre-wrap;
+    }}
+    code {{
+      font-family: Consolas, "Courier New", monospace;
+    }}
+    a {{
+      color: #0f5bd7;
+      text-decoration: none;
+    }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Gemini Cookie 管理</h1>
+  <p class="muted">从本机可读取的 Chrome / Edge Cookie 数据库刷新 Gemini 登录态，并在不中断 Web 服务的情况下重载 Gemini 客户端。页面不会显示 Cookie 值。</p>
+
+  <section class="panel">
+    <div class="grid">
+      <div class="metric">
+        <div class="label">账号状态</div>
+        <div id="accountName" class="value {'ok' if account_status['authenticated'] else 'bad'}">{html.escape(str(account_status['name']))}</div>
+      </div>
+      <div class="metric">
+        <div class="label">已认证</div>
+        <div id="authenticated" class="value {'ok' if account_status['authenticated'] else 'bad'}">{str(account_status['authenticated']).lower()}</div>
+      </div>
+      <div class="metric">
+        <div class="label">Cookie 文件</div>
+        <div class="value"><code>{html.escape(str(cookie_path or '未配置'))}</code></div>
+      </div>
+      <div class="metric">
+        <div class="label">缓存目录</div>
+        <div class="value"><code>{html.escape(cache_path or '未配置')}</code></div>
+      </div>
+    </div>
+    <p>
+      <button id="refreshBtn" type="button">刷新 Cookie 并重载客户端</button>
+      <a href="/usage.html" style="margin-left: 12px;">查看用量</a>
+    </p>
+  </section>
+
+  <h2>执行结果</h2>
+  <pre id="output">等待操作。</pre>
+</main>
+<script>
+const output = document.getElementById("output");
+const button = document.getElementById("refreshBtn");
+const accountName = document.getElementById("accountName");
+const authenticated = document.getElementById("authenticated");
+
+function show(data) {{
+  output.textContent = JSON.stringify(data, null, 2);
+}}
+
+async function loadHealth() {{
+  const response = await fetch("/health");
+  const data = await response.json();
+  const status = data.account_status || {{}};
+  accountName.textContent = status.name || "UNKNOWN";
+  authenticated.textContent = String(Boolean(status.authenticated));
+  accountName.className = "value " + (status.authenticated ? "ok" : "bad");
+  authenticated.className = "value " + (status.authenticated ? "ok" : "bad");
+}}
+
+button.addEventListener("click", async () => {{
+  button.disabled = true;
+  output.textContent = "正在刷新 Cookie、清理缓存并重载 Gemini 客户端...";
+  try {{
+    const response = await fetch("/admin/refresh-cookies", {{ method: "POST" }});
+    const data = await response.json();
+    show(data);
+    await loadHealth();
+  }} catch (error) {{
+    output.textContent = String(error);
+  }} finally {{
+    button.disabled = false;
+  }}
+}});
+
+loadHealth().catch(error => {{
+  output.textContent = String(error);
+}});
+</script>
+</body>
+</html>"""
+    return HTMLResponse(body)
 
 
 @app.get("/v1/models")
@@ -1616,6 +3044,7 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
 
 @app.get("/usage.html", response_class=HTMLResponse)
 async def usage_dashboard(limit: int = 20) -> HTMLResponse:
+    return RedirectResponse(url="/#usage", status_code=307)
     data = await usage_summary(limit=limit)
     totals = data["totals"]
     by_model = data["by_model"]
@@ -1914,6 +3343,7 @@ async def chat_completions(
 
     try:
         client = _get_client(request)
+        _ensure_client_authenticated(client)
         prompt = _messages_to_prompt(payload.messages)
         _write_debug_prompt(prompt)
         gemini_model = _select_gemini_model(payload.model)
@@ -1935,18 +3365,32 @@ async def chat_completions(
             logger.info("max_tokens=%s is accepted but ignored.", payload.max_tokens)
 
         if payload.stream:
-            upstream, buffered_deltas = await _prime_gemini_stream(
-                client,
-                prompt,
-                gemini_model,
-            )
-            logger.info(
-                "Gemini streaming connection opened: id=%s buffered_chunks=%s",
-                completion_id,
-                len(buffered_deltas),
-            )
+            buffered_deltas: list[str] = []
+            if _stream_eager_enabled():
+                upstream = client.generate_content_stream(
+                    prompt,
+                    model=gemini_model,
+                    current_retry=_upstream_retry_count(),
+                )
+                logger.info(
+                    "Gemini streaming connection opened eagerly: id=%s",
+                    completion_id,
+                )
+            else:
+                upstream, buffered_deltas = await _prime_gemini_stream(
+                    client,
+                    prompt,
+                    gemini_model,
+                )
+                logger.info(
+                    "Gemini streaming connection opened after priming: "
+                    "id=%s buffered_chunks=%s",
+                    completion_id,
+                    len(buffered_deltas),
+                )
             return EventSourceResponse(
                 _openai_sse_events(
+                    client,
                     upstream,
                     buffered_deltas,
                     completion_id,
@@ -1956,10 +3400,15 @@ async def chat_completions(
                     created,
                 ),
                 media_type="text/event-stream",
+                ping=_stream_ping_seconds(),
             )
 
         logger.info("Calling Gemini non-streaming generation: id=%s", completion_id)
-        output = await client.generate_content(prompt, model=gemini_model)
+        output = await client.generate_content(
+            prompt,
+            model=gemini_model,
+            current_retry=_upstream_retry_count(),
+        )
         text = getattr(output, "text", "") or ""
         usage, cost_estimate = _build_usage(gemini_model, prompt, text)
         _record_usage(
@@ -1970,6 +3419,7 @@ async def chat_completions(
             usage,
             cost_estimate,
         )
+        await _write_client_cookies_back(client, "non-stream-response")
 
         logger.info(
             "Completed non-streaming response: id=%s response_chars=%s",

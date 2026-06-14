@@ -35,6 +35,27 @@ $env:OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_CHARS = "120000"
 
 When Cline asks Gemini to inspect an explicitly named source file, the adapter can attach a read-only copy of that file to the prompt. This helps Gemini continue even when it misunderstands Cline's XML tool results. Secret-looking files such as cookies, local env files, usage logs, token/password files, and debug prompts are blocked from this local context.
 
+For Cline responsiveness, streaming requests default to eager SSE mode:
+
+- `OPENAI_ADAPTER_STREAM_EAGER=1` returns the SSE connection immediately instead of waiting for Gemini's first text chunk.
+- `OPENAI_ADAPTER_STREAM_PING_SECONDS=15` keeps the stream alive while Gemini is thinking.
+- `OPENAI_ADAPTER_STREAM_FALLBACK_NON_STREAM=1` retries once with non-streaming generation when Gemini's stream fails before any answer text is emitted.
+- `OPENAI_ADAPTER_STREAM_FALLBACK_MODEL=gemini-3-flash` uses Flash as the fallback model because Pro can be more fragile with long Cline prompts on the Gemini web stream endpoint.
+- Set `OPENAI_ADAPTER_STREAM_EAGER=0` only if you prefer the older behavior where upstream startup errors can still become HTTP 500 JSON before SSE starts.
+
+## Cookie writeback
+
+Keep these lines enabled in `adapter_env.local.ps1`:
+
+```powershell
+$env:OPENAI_ADAPTER_COOKIE_WRITEBACK = "1"
+$env:OPENAI_ADAPTER_COOKIE_WRITEBACK_INTERVAL_SECONDS = "60"
+```
+
+When the upstream Gemini client refreshes or rotates `__Secure-1PSID` / `__Secure-1PSIDTS`, the adapter writes the refreshed values back to `gemini_cookies.local.json`. The writeback runs on startup, periodically while the server is running, after successful responses, and before shutdown. It only writes when Gemini account status is authenticated.
+
+This does not recover an already invalid browser session. If `/health` reports `UNAUTHENTICATED`, copy fresh cookies from the browser once, restart the adapter, and then writeback can keep later rotations in the local JSON file.
+
 This repository also includes:
 
 - `.clineignore` to keep secrets, logs, caches, usage files, and prompt dumps out of Cline context.
@@ -77,6 +98,8 @@ Set-Location "Gemini-API"; python -m py_compile openai_adapter_server.py; if ($L
 - Health: `http://127.0.0.1:8000/health`
 - Usage JSON: `http://127.0.0.1:8000/usage`
 - Usage Dashboard: `http://127.0.0.1:8000/usage.html`
+
+`/health` also reports Gemini account status. If it shows `UNAUTHENTICATED`, refresh `gemini_cookies.local.json` from the browser and restart the adapter before testing Cline again.
 
 ## Multi-PC usage dashboard
 
