@@ -13,23 +13,39 @@ if (Test-Path $stage) {
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 $files = @(
+    "LICENSE",
+    "pyproject.toml",
     "openai_adapter_server.py",
+    "refresh_gemini_cookies_from_browser.py",
+    "capture_edge_gemini_cookies_cdp.py",
     "start_ai_server.bat",
     "open_usage_dashboard.bat",
     "install_adapter_dependencies.bat",
     "adapter_env.example.ps1",
     "gemini_cookies.example.json",
-    "COMPANY_SYNC_README.md",
-    "export_company_sync_pack.ps1"
+    "export_company_sync_pack.ps1",
+    ".clinerules",
+    ".clineignore",
+    ".gitignore"
 )
 
 foreach ($file in $files) {
     Copy-Item -LiteralPath (Join-Path $root $file) -Destination (Join-Path $stage $file) -Force
 }
 
+Get-ChildItem -LiteralPath $root -File -Filter "*.md" |
+    ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stage $_.Name) -Force
+    }
+
+$srcDir = Join-Path $stage "src"
+New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
+Copy-Item -LiteralPath (Join-Path $root "src\gemini_webapi") -Destination $srcDir -Recurse -Force
+
 $usageSyncDir = Join-Path $stage "usage-sync"
 New-Item -ItemType Directory -Force -Path $usageSyncDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $root "usage-sync\.gitkeep") -Destination (Join-Path $usageSyncDir ".gitkeep") -Force
+Copy-Item -LiteralPath (Join-Path $root "usage-sync\README.md") -Destination (Join-Path $usageSyncDir "README.md") -Force
 
 if (Test-Path $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force

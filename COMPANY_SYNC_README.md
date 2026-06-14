@@ -1,19 +1,18 @@
 # Gemini OpenAI Adapter Sync Pack
 
-This pack contains only the local OpenAI-compatible adapter files. It does not include your private Gemini cookies.
+This repository contains the local OpenAI-compatible adapter plus the vendored Gemini WebAPI client it imports at runtime. It does not include your private Gemini cookies.
 
 ## Company PC setup
 
-1. Clone or copy the original `HanaokaYuzu/Gemini-API` repository to the company PC.
-2. Copy these adapter files into the repository root.
-3. Run `install_adapter_dependencies.bat`.
-4. Copy `adapter_env.example.ps1` to `adapter_env.local.ps1`.
-5. Copy `gemini_cookies.example.json` to `gemini_cookies.local.json`.
-6. Fill `gemini_cookies.local.json` with the company PC browser's Gemini cookies:
+1. Clone or copy `youyi666/gemini-openai-adapter` to the company PC.
+2. Run `install_adapter_dependencies.bat`.
+3. Copy `adapter_env.example.ps1` to `adapter_env.local.ps1`.
+4. Copy `gemini_cookies.example.json` to `gemini_cookies.local.json`.
+5. Fill `gemini_cookies.local.json` with the company PC browser's Gemini cookies:
    - `__Secure-1PSID`
    - `__Secure-1PSIDTS`
-7. Start the local API with `start_ai_server.bat`.
-8. Open usage dashboard with `open_usage_dashboard.bat`.
+6. Start the local API with `start_ai_server.bat`.
+7. Open usage dashboard with `open_usage_dashboard.bat`.
 
 ## Cline configuration
 
@@ -21,6 +20,8 @@ This pack contains only the local OpenAI-compatible adapter files. It does not i
 - Base URL: `http://127.0.0.1:8000/v1`
 - API Key: `dummy`
 - Model ID: `gemini-3-pro`
+
+If a client expects the provider root instead of an OpenAI `/v1` root, use `http://127.0.0.1:8000`. The adapter exposes both `/v1/chat/completions` and `/chat/completions`.
 
 ## Cline file-reading compatibility
 

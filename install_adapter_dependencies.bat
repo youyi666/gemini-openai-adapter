@@ -1,9 +1,14 @@
 @echo off
 title Install Gemini Adapter Dependencies
 cd /d "%~dp0"
-echo Installing Gemini-API package and OpenAI adapter dependencies...
-python -m pip install -e .[browser]
-python -m pip install fastapi uvicorn sse-starlette
+echo Installing Gemini OpenAI Adapter and browser cookie helpers...
+python -m pip install -e ".[browser]"
+if errorlevel 1 (
+  echo.
+  echo Install failed. Check Python and pip, then run this script again.
+  pause
+  exit /b 1
+)
 echo.
-echo Done. Copy adapter_env.example.ps1 to adapter_env.local.ps1 and gemini_cookies.example.json to gemini_cookies.local.json, then fill in your Gemini cookies.
+echo Done. Copy adapter_env.example.ps1 to adapter_env.local.ps1 and gemini_cookies.example.json to gemini_cookies.local.json, then start the server.
 pause

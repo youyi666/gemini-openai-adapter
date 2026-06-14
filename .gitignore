@@ -218,5 +218,6 @@ test_cline_write.txt
 !usage-sync/
 !usage-sync/.gitkeep
 !usage-sync/README.md
+提示词*.txt
 提示词.txt
 提示词2.txt

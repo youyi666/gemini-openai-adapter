@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible FastAPI adapter for HanaokaYuzu/Gemini-API.
+"""OpenAI-compatible FastAPI adapter for the vendored Gemini WebAPI client.
 
 This file is intentionally standalone. It imports the upstream Gemini client and
-does not modify the cloned package internals.
+does not modify the vendored package internals.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from typing import Any, AsyncGenerator
 
 try:
     from fastapi import FastAPI, Request
+    from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
     from pydantic import BaseModel, ConfigDict, Field
     from sse_starlette.sse import EventSourceResponse
@@ -638,6 +639,23 @@ async def lifespan(app_: FastAPI):
 
 
 app = FastAPI(title="Gemini WebAPI OpenAI Adapter", lifespan=lifespan)
+
+
+def _cors_allow_origins() -> list[str]:
+    raw = os.getenv("OPENAI_ADAPTER_CORS_ORIGINS", "*").strip()
+    if not raw:
+        return ["*"]
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+_cors_origins = _cors_allow_origins()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials="*" not in _cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _get_client(request: Request) -> GeminiClient:
@@ -1494,6 +1512,67 @@ def _compact_cline_user_message(text: str) -> str:
     return text
 
 
+def _truncate_middle(text: str, max_chars: int, reason: str) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    marker = (
+        f"\n\n[adapter truncated {len(text) - max_chars:,} chars from the "
+        f"middle: {reason}]\n\n"
+    )
+    if max_chars <= len(marker) + 200:
+        return text[:max_chars] + "\n\n[adapter truncated long content]"
+
+    head_chars = max(100, int(max_chars * 0.62))
+    tail_chars = max(100, max_chars - head_chars - len(marker))
+    return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
+
+
+def _compact_cline_history_messages(
+    prepared: list[tuple[str, str]],
+    *,
+    label: str = "Cline",
+) -> list[tuple[str, str]]:
+    max_chars = max(
+        2_000,
+        _env_int("OPENAI_ADAPTER_CLINE_MESSAGE_MAX_CHARS", 18_000),
+    )
+    older_max_chars = max(
+        1_000,
+        _env_int("OPENAI_ADAPTER_CLINE_OLDER_MESSAGE_MAX_CHARS", 7_000),
+    )
+    keep_recent = max(1, _env_int("OPENAI_ADAPTER_CLINE_KEEP_RECENT_MESSAGES", 8))
+    recent_start = max(0, len(prepared) - keep_recent)
+    compacted: list[tuple[str, str]] = []
+    truncated_count = 0
+
+    for index, (role, text) in enumerate(prepared):
+        role_key = (role or "").lower()
+        limit = max_chars
+        if index < recent_start and role_key in {"assistant", "tool", "function"}:
+            limit = older_max_chars
+        if len(text) > limit:
+            truncated_count += 1
+            text = _truncate_middle(
+                text,
+                limit,
+                f"long {label} {role_key or 'message'} history",
+            )
+        compacted.append((role, text))
+
+    if truncated_count:
+        logger.info(
+            "Compacted long %s history messages: truncated=%s max_chars=%s "
+            "older_max_chars=%s keep_recent=%s",
+            label,
+            truncated_count,
+            max_chars,
+            older_max_chars,
+            keep_recent,
+        )
+    return compacted
+
+
 LOCAL_CONTEXT_FILE_RE = re.compile(
     r"(?:[A-Za-z]:[\\/])?(?:[\w .()\-\u4e00-\u9fff]+[\\/])*"
     r"[\w .()\-\u4e00-\u9fff]+\."
@@ -1647,7 +1726,10 @@ def _format_local_context_file(path: Path, remaining_chars: int) -> str:
     )
 
 
-def _build_local_file_context(prepared_messages: list[tuple[str, str]]) -> str:
+def _build_local_file_context(
+    prepared_messages: list[tuple[str, str]],
+    max_chars_override: int | None = None,
+) -> str:
     if not _env_bool("OPENAI_ADAPTER_LOCAL_FILE_CONTEXT", True):
         return ""
 
@@ -1659,6 +1741,15 @@ def _build_local_file_context(prepared_messages: list[tuple[str, str]]) -> str:
     cwd = _extract_cwd_from_text(combined_text)
     max_files = _env_int("OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_FILES", 3)
     max_chars = _env_int("OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_CHARS", 120000)
+    if max_chars_override is not None:
+        max_chars = min(max_chars, max(0, max_chars_override))
+    if max_chars < 1_000:
+        logger.info(
+            "Skipped local file context because remaining prompt budget is small: "
+            "max_chars=%s",
+            max_chars,
+        )
+        return ""
     resolved_paths: list[Path] = []
     seen: set[str] = set()
 
@@ -1687,6 +1778,8 @@ def _build_local_file_context(prepared_messages: list[tuple[str, str]]) -> str:
         except OSError:
             logger.info("Failed to read local file context: %s", path, exc_info=True)
             continue
+        if len(section) > remaining:
+            section = section[:remaining] + "\n\n[truncated by adapter prompt budget]"
         sections.append(section)
         remaining -= len(section)
 
@@ -1724,7 +1817,7 @@ def _prepare_messages_for_gemini(
     cline_detected = any(_is_cline_system_prompt(text) for _, text in raw_messages)
 
     if not cline_detected:
-        return raw_messages, False
+        return _compact_cline_history_messages(raw_messages, label="OpenAI"), False
 
     prepared: list[tuple[str, str]] = []
     compact_system_added = False
@@ -1746,10 +1839,15 @@ def _prepare_messages_for_gemini(
         else:
             prepared.append((role, text))
 
-    return prepared, True
+    return _compact_cline_history_messages(prepared, label="Cline"), True
 
 
-def _messages_to_prompt(messages: list[ChatMessage]) -> str:
+def _messages_to_prompt(
+    messages: list[ChatMessage],
+    *,
+    include_local_context: bool = True,
+    local_context_max_chars: int | None = None,
+) -> str:
     if not messages:
         raise ValueError("messages must contain at least one item.")
 
@@ -1785,8 +1883,11 @@ def _messages_to_prompt(messages: list[ChatMessage]) -> str:
         prompt_parts.append("System instructions:\n" + "\n\n".join(system_parts))
     if conversation_parts:
         prompt_parts.append("Conversation:\n" + "\n\n".join(conversation_parts))
-    if compacted:
-        local_file_context = _build_local_file_context(prepared_messages)
+    if compacted and include_local_context:
+        local_file_context = _build_local_file_context(
+            prepared_messages,
+            local_context_max_chars,
+        )
         if local_file_context:
             prompt_parts.append(local_file_context)
 
@@ -1850,6 +1951,69 @@ def _ensure_prompt_budget(prompt: str) -> int:
             "Split the task into smaller phases or reduce the attached context."
         )
     return prompt_tokens
+
+
+def _build_prompt_with_budget(messages: list[ChatMessage]) -> tuple[str, int]:
+    max_prompt_tokens = _max_prompt_tokens()
+    prompt = _messages_to_prompt(messages)
+    prompt_tokens = _estimate_tokens(prompt)
+    if not max_prompt_tokens or prompt_tokens <= max_prompt_tokens:
+        return prompt, prompt_tokens
+
+    base_prompt = _messages_to_prompt(messages, include_local_context=False)
+    base_tokens = _estimate_tokens(base_prompt)
+    if base_tokens > max_prompt_tokens:
+        raise ValueError(
+            "Prompt is too large for the configured Gemini adapter budget even "
+            "after dropping adapter-added file context: "
+            f"estimated {base_tokens:,} tokens > limit {max_prompt_tokens:,}. "
+            "Start a fresh Cline task or split the task into smaller phases."
+        )
+
+    remaining_tokens = max_prompt_tokens - base_tokens
+    if remaining_tokens < 800:
+        logger.info(
+            "Dropped local file context to stay within prompt budget: "
+            "base_tokens=%s max_prompt_tokens=%s",
+            base_tokens,
+            max_prompt_tokens,
+        )
+        return base_prompt, base_tokens
+
+    char_budget = min(
+        _env_int("OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_CHARS", 120000),
+        max(1_000, int((remaining_tokens - 256) * 3)),
+    )
+    for attempt in range(6):
+        candidate = _messages_to_prompt(
+            messages,
+            include_local_context=True,
+            local_context_max_chars=char_budget,
+        )
+        candidate_tokens = _estimate_tokens(candidate)
+        if candidate_tokens <= max_prompt_tokens:
+            logger.info(
+                "Shrank local file context to fit prompt budget: "
+                "attempt=%s prompt_tokens=%s max_prompt_tokens=%s "
+                "local_context_max_chars=%s",
+                attempt + 1,
+                candidate_tokens,
+                max_prompt_tokens,
+                char_budget,
+            )
+            return candidate, candidate_tokens
+        ratio = max_prompt_tokens / max(candidate_tokens, 1)
+        char_budget = int(char_budget * ratio * 0.82)
+        if char_budget < 1_000:
+            break
+
+    logger.info(
+        "Dropped local file context after shrink attempts: base_tokens=%s "
+        "max_prompt_tokens=%s",
+        base_tokens,
+        max_prompt_tokens,
+    )
+    return base_prompt, base_tokens
 
 
 def _get_usage_log_path() -> Path:
@@ -3890,6 +4054,7 @@ loadHealth().catch(error => {{
     return HTMLResponse(body)
 
 
+@app.get("/models")
 @app.get("/v1/models")
 async def list_models(request: Request) -> dict[str, Any]:
     client = _get_client(request)
@@ -4309,6 +4474,7 @@ async def usage_dashboard(limit: int = 20) -> HTMLResponse:
     return HTMLResponse(body)
 
 
+@app.post("/chat/completions", response_model=None)
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(
     payload: ChatCompletionRequest,
@@ -4320,8 +4486,7 @@ async def chat_completions(
     try:
         client = _get_client(request)
         _ensure_client_authenticated(client)
-        prompt = _messages_to_prompt(payload.messages)
-        prompt_tokens = _ensure_prompt_budget(prompt)
+        prompt, prompt_tokens = _build_prompt_with_budget(payload.messages)
         _write_debug_prompt(prompt)
         gemini_model = _select_gemini_model(payload.model)
 
