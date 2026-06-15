@@ -9,6 +9,10 @@ Runtime files are named like:
 adapter_usage.<computer-name>.jsonl
 ```
 
+If the computer name contains non-ASCII characters, the adapter writes a stable
+safe file name such as `adapter_usage.pc-bf8048e9b4.jsonl` and keeps the readable
+computer name inside each record.
+
 They contain timestamps, model names, token estimates, and estimated costs.
 They do not contain prompt or response text.
 
@@ -17,5 +21,5 @@ If this repository is private and you want Git-based aggregation, explicitly add
 the usage files:
 
 ```powershell
-git add -f usage-sync/adapter_usage.<computer-name>.jsonl
+git add usage-sync/adapter_usage*.jsonl
 ```
