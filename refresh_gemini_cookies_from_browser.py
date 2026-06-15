@@ -51,7 +51,7 @@ DIRECT_BROWSER_CONFIGS = {
 
 
 def _configured_browser() -> str:
-    raw = os.getenv("OPENAI_ADAPTER_COOKIE_BROWSER", "auto").strip().lower()
+    raw = os.getenv("OPENAI_ADAPTER_COOKIE_BROWSER", "chrome").strip().lower()
     aliases = {
         "": "auto",
         "google-chrome": "chrome",

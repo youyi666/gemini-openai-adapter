@@ -182,7 +182,7 @@ def refresh_cookies() -> int:
     if not (ROOT / "adapter_env.local.ps1").exists():
         init_local_files()
     return powershell(
-        ". .\\adapter_env.local.ps1; python .\\refresh_gemini_cookies_from_browser.py",
+        ". .\\adapter_env.local.ps1; .\\repair_auth_with_browser_cdp.ps1 -SkipChatTest",
         title="刷新浏览器 Cookie",
     )
 

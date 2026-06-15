@@ -8,6 +8,7 @@ does not modify the vendored package internals.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -187,7 +188,7 @@ Replacement complete lines.
 - On Windows PowerShell, do not chain commands with `&&`; it fails in Windows PowerShell 5.x. Use `;` or separate tool calls, and prefer `Set-Location "actual/path"; command`.
 - When checking command success in PowerShell, inspect `$LASTEXITCODE`. For example:
 <execute_command>
-<command>Set-Location "Gemini-API"; python -m py_compile openai_adapter_server.py; if ($LASTEXITCODE -eq 0) {{ Write-Host "Syntax check passed" }} else {{ exit $LASTEXITCODE }}</command>
+<command>$root = git rev-parse --show-toplevel; Set-Location $root; python -m py_compile openai_adapter_server.py; if ($LASTEXITCODE -eq 0) {{ Write-Host "Syntax check passed" }} else {{ exit $LASTEXITCODE }}</command>
 <requires_approval>false</requires_approval>
 </execute_command>
 - If command output cannot be captured, the terminal shows `^C`, or visible output contains `fatal:`, `ParserError`, or `InvalidEndOfLine`, do not claim success. Retry with a simpler command, correct the working directory, or ask the user for the visible output.
@@ -339,7 +340,7 @@ def _cookie_writeback_interval_seconds() -> int:
 
 
 def _cookie_refresh_config() -> dict[str, str]:
-    browser = os.getenv("OPENAI_ADAPTER_COOKIE_BROWSER", "auto").strip() or "auto"
+    browser = os.getenv("OPENAI_ADAPTER_COOKIE_BROWSER", "chrome").strip() or "chrome"
     profile = os.getenv("OPENAI_ADAPTER_COOKIE_PROFILE", "Default").strip() or "Default"
     return {
         "browser": browser,
@@ -2028,7 +2029,20 @@ def _get_usage_log_path() -> Path:
 def _usage_instance_id() -> str:
     raw = os.getenv("OPENAI_ADAPTER_INSTANCE_ID") or socket.gethostname() or "unknown"
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw.strip()).strip(".-")
-    return cleaned or "unknown"
+    if cleaned:
+        return cleaned
+    digest = hashlib.sha1(raw.strip().encode("utf-8", errors="ignore")).hexdigest()[:10]
+    return f"pc-{digest}" if digest else "unknown"
+
+
+def _usage_instance_name() -> str:
+    raw = (
+        os.getenv("OPENAI_ADAPTER_INSTANCE_NAME")
+        or os.getenv("OPENAI_ADAPTER_INSTANCE_ID")
+        or socket.gethostname()
+        or "unknown"
+    )
+    return raw.strip() or _usage_instance_id()
 
 
 def _get_shared_usage_dir() -> Path | None:
@@ -2156,6 +2170,7 @@ def _record_usage(
         "timestamp": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
         "id": completion_id,
         "instance_id": _usage_instance_id(),
+        "instance_name": _usage_instance_name(),
         "host": socket.gethostname(),
         "requested_model": requested_model,
         "gemini_model": gemini_model,
@@ -2182,6 +2197,31 @@ def _infer_instance_id_from_path(path: Path) -> str:
         if stem.startswith(prefix):
             return stem[len(prefix) :] or "unknown"
     return _usage_instance_id()
+
+
+def _record_instance_id(record: dict[str, Any]) -> str:
+    return str(record.get("instance_id") or record.get("host") or "unknown")
+
+
+def _record_instance_label(record: dict[str, Any]) -> str:
+    name = str(record.get("instance_name") or "").strip()
+    if name:
+        return name
+    instance_id = str(record.get("instance_id") or "").strip()
+    host = str(record.get("host") or "").strip()
+    if host and (not instance_id or instance_id == "unknown" or instance_id.startswith("pc-")):
+        return host
+    return instance_id or host or "unknown"
+
+
+def _record_looks_local(record: dict[str, Any], source_path: Path) -> bool:
+    if _same_path(source_path, _get_usage_log_path()):
+        return True
+    current_shared_path = _get_shared_usage_log_path()
+    if current_shared_path is not None and _same_path(source_path, current_shared_path):
+        return True
+    host = str(record.get("host") or "")
+    return host in {socket.gethostname(), _usage_instance_name()}
 
 
 def _usage_log_paths() -> list[Path]:
@@ -2218,6 +2258,9 @@ def _read_usage_records_from_path(path: Path) -> tuple[list[dict[str, Any]], int
             if isinstance(record, dict):
                 record.setdefault("instance_id", fallback_instance_id)
                 record.setdefault("host", record.get("instance_id") or fallback_instance_id)
+                if str(record.get("instance_id") or "") == "unknown" and _record_looks_local(record, path):
+                    record["instance_id"] = _usage_instance_id()
+                record.setdefault("instance_name", _record_instance_label(record))
                 record["_source_file"] = str(path)
                 records.append(record)
     except OSError:
@@ -3441,7 +3484,7 @@ async function loadUsage() {
     const cost = record.cost_estimate || {};
     return `<tr>
       <td>${escapeHtml(record.timestamp || "")}</td>
-      <td>${escapeHtml(record.instance_id || record.host || "unknown")}</td>
+      <td>${escapeHtml(record.instance_name || record.host || record.instance_id || "unknown")}</td>
       <td>${escapeHtml(record.requested_model || "")}</td>
       <td>${escapeHtml(record.gemini_model || "")}</td>
       <td>${record.stream ? "是" : "否"}</td>
@@ -4108,7 +4151,8 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
         usage = record.get("usage") or {}
         cost = record.get("cost_estimate") or {}
         model = record.get("requested_model") or "unknown"
-        instance_id = str(record.get("instance_id") or record.get("host") or "unknown")
+        instance_id = _record_instance_id(record)
+        instance_label = _record_instance_label(record)
         model_totals = by_model.setdefault(
             model,
             {
@@ -4121,8 +4165,10 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
             },
         )
         instance_totals = by_instance.setdefault(
-            instance_id,
+            instance_label,
             {
+                "instance_id": instance_id,
+                "display_name": instance_label,
                 "requests": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
@@ -4171,8 +4217,10 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
         "note": "Gemini API paid-tier equivalent estimate; not actual Gemini web billing.",
         "pricing_source": PRICING_SOURCE_URL,
         "instance_id": _usage_instance_id(),
+        "instance_name": _usage_instance_name(),
         "usage_log_path": str(path),
         "shared_usage_dir": str(shared_dir) if shared_dir is not None else None,
+        "shared_usage_log_path": str(_get_shared_usage_log_path() or ""),
         "usage_sources": usage_sources,
         "usd_to_cny": _env_float("OPENAI_ADAPTER_USD_TO_CNY", 7.25),
         "totals": totals,

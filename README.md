@@ -74,7 +74,9 @@ cli.py
 ```text
 openai_adapter_server.py               FastAPI OpenAI 兼容服务
 refresh_gemini_cookies_from_browser.py 从 Chrome / Edge 刷新 Gemini Cookie
-capture_edge_gemini_cookies_cdp.py     Edge CDP Cookie 抓取辅助脚本
+capture_browser_gemini_cookies_cdp.py  Chrome / Edge CDP Cookie 抓取辅助脚本
+capture_edge_gemini_cookies_cdp.py     旧版 Edge CDP Cookie 抓取辅助脚本
+repair_auth_with_browser_cdp.ps1       Chrome / Edge CDP 登录态修复脚本
 START_HERE.bat                         团队统一入口
 team_menu.py                           中文启动菜单
 TEAM_QUICK_START.md                    同事 5 分钟快速上手说明
@@ -146,7 +148,8 @@ OpenAI SSE chunks / JSON response
 进入项目目录：
 
 ```powershell
-Set-Location "D:\GeminiAPI\Gemini-API"
+$root = git rev-parse --show-toplevel
+Set-Location $root
 ```
 
 安装依赖：
@@ -183,19 +186,23 @@ $env:OPENAI_ADAPTER_HOST = "127.0.0.1"
 $env:OPENAI_ADAPTER_PORT = "8000"
 $env:GEMINI_DEFAULT_MODEL = "gemini-3-pro"
 $env:OPENAI_ADAPTER_MAX_PROMPT_TOKENS = "48000"
-$env:OPENAI_ADAPTER_COOKIE_BROWSER = "auto"
+$env:OPENAI_ADAPTER_COOKIE_BROWSER = "chrome"
 $env:OPENAI_ADAPTER_COOKIE_PROFILE = "Default"
+$env:OPENAI_ADAPTER_CHROME_USER_DATA_DIR = Join-Path $PSScriptRoot ".chrome-gemini-profile"
 ```
 
 Cookie 来源可选值：
 
 ```powershell
-$env:OPENAI_ADAPTER_COOKIE_BROWSER = "auto"   # 自动选择
 $env:OPENAI_ADAPTER_COOKIE_BROWSER = "chrome" # 只读 Chrome
 $env:OPENAI_ADAPTER_COOKIE_BROWSER = "edge"   # 只读 Edge
+$env:OPENAI_ADAPTER_COOKIE_BROWSER = "auto"   # 自动选择
 ```
 
 如果给 adapter 准备了专用浏览器 Profile，把 `OPENAI_ADAPTER_COOKIE_PROFILE` 改成真实目录名，比如 `Profile 1`。
+
+Chrome 新版本可能不允许对日常 `Default` 用户目录开启 CDP 调试。`repair_auth_with_browser_cdp.ps1`
+默认使用项目内的 `.chrome-gemini-profile` 专用目录，只在这个专用窗口登录 Gemini。
 
 ## 启动
 
@@ -208,7 +215,8 @@ start_ai_server.bat
 或者 PowerShell 启动：
 
 ```powershell
-Set-Location "D:\GeminiAPI\Gemini-API"
+$root = git rev-parse --show-toplevel
+Set-Location $root
 . .\adapter_env.local.ps1
 python .\openai_adapter_server.py
 ```

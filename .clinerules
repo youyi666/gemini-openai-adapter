@@ -1,8 +1,8 @@
 # Gemini OpenAI Adapter project rules
 
 - Respond to the user in Chinese by default.
-- The normal repository root is `D:\GeminiAPI\Gemini-API`.
-- This machine uses Windows PowerShell. Do not use `&&`; use `;` or separate command calls. Prefer `Set-Location "D:\GeminiAPI\Gemini-API"; command`.
+- The repository root is the folder containing `openai_adapter_server.py`, `pyproject.toml`, and `.git`. Do not assume it is named `Gemini-API`; cloned folders may be named `gemini-openai-adapter` or another local name.
+- This machine uses Windows PowerShell. Do not use `&&`; use `;` or separate command calls. Prefer `Set-Location (git rev-parse --show-toplevel); command` when already somewhere inside the repo.
 - Check PowerShell command success with `$LASTEXITCODE`. Do not claim success if visible output contains `fatal:`, `ParserError`, `InvalidEndOfLine`, or `^C`.
 - Treat the upstream Gemini-API core as read-only unless the user explicitly asks otherwise. Prefer adapter changes in `openai_adapter_server.py` and adapter helper files.
 - Keep Gemini adapter prompt input within the practical 32k-token working budget. The adapter hard stop is 48k tokens, and the local probe found about 64k tokens can succeed but 128k fails.

@@ -18,7 +18,7 @@ IDE 插件把它当成 OpenAI API 调用，实际请求会由本项目转发到 
 2. 双击 `START_HERE.bat`。
 3. 在菜单里先选 `2. 初始化本地配置文件`。
 4. 再选 `3. 安装/更新依赖`。
-5. 确认 Chrome 或 Edge 里的 Gemini 网页可以正常发送消息。
+5. 确认 Chrome 里的 Gemini 网页可以正常发送消息。
 6. 回到菜单选 `6. 刷新浏览器 Cookie`。
 7. 选 `4. 启动服务`，看到 `Uvicorn running on http://127.0.0.1:8000` 表示服务已启动。
 8. 新开一个菜单窗口，选 `7. 运行兼容自测`。
@@ -111,6 +111,6 @@ dist/
 
 ## 给维护者的提醒
 
-- 改功能后先运行 `python -m py_compile openai_adapter_server.py refresh_gemini_cookies_from_browser.py capture_edge_gemini_cookies_cdp.py team_menu.py`。
+- 改功能后先运行 `python -m py_compile openai_adapter_server.py refresh_gemini_cookies_from_browser.py capture_browser_gemini_cookies_cdp.py capture_edge_gemini_cookies_cdp.py team_menu.py`。
 - 再启动服务，运行 `test_adapter_openai_compat.ps1`。
 - 推送前确认 `git status --short` 里没有 Cookie、本地配置、用量日志。

@@ -89,14 +89,14 @@ The compact prompt tells Cline to avoid Unix-style command chaining in Windows P
 
 - Do not use `&&` in Windows PowerShell 5.x.
 - Use `;` or separate command calls instead.
-- Prefer `Set-Location "Gemini-API"; git status --short` over `cd Gemini-API && git status --short`.
+- Prefer `$root = git rev-parse --show-toplevel; Set-Location $root; git status --short` over `cd <repo-folder> && git status --short`.
 - For verification commands, check `$LASTEXITCODE` before claiming success.
 - If visible terminal output contains `fatal:`, `ParserError`, `InvalidEndOfLine`, or `^C`, treat the command as failed even if Cline says the output was not captured.
 
 Example:
 
 ```powershell
-Set-Location "Gemini-API"; python -m py_compile openai_adapter_server.py; if ($LASTEXITCODE -eq 0) { Write-Host "Syntax check passed" } else { exit $LASTEXITCODE }
+$root = git rev-parse --show-toplevel; Set-Location $root; python -m py_compile openai_adapter_server.py; if ($LASTEXITCODE -eq 0) { Write-Host "Syntax check passed" } else { exit $LASTEXITCODE }
 ```
 
 ## Useful URLs
@@ -113,8 +113,12 @@ The adapter can aggregate usage from multiple computers without a database.
 Each computer writes its own shared usage file:
 
 ```text
-usage-sync/adapter_usage.<computer-name>.jsonl
+usage-sync/adapter_usage.<safe-computer-id>.jsonl
 ```
+
+When the Windows computer name contains non-ASCII characters, the adapter
+generates a stable safe ID such as `pc-bf8048e9b4` for the file name while still
+showing the readable computer name in the dashboard.
 
 Recommended setup:
 
@@ -122,11 +126,12 @@ Recommended setup:
 2. Keep these lines in `adapter_env.local.ps1` on every computer:
 
    ```powershell
+   $env:OPENAI_ADAPTER_INSTANCE_NAME = $env:COMPUTERNAME
    $env:OPENAI_ADAPTER_INSTANCE_ID = $env:COMPUTERNAME
    $env:OPENAI_ADAPTER_USAGE_SHARED_DIR = Join-Path $PSScriptRoot "usage-sync"
    ```
 
-3. If you use Git, commit and pull the `usage-sync/adapter_usage.<computer-name>.jsonl` files when you want the dashboard to include another computer.
+3. If you use Git, commit and pull the `usage-sync/adapter_usage*.jsonl` files when you want the dashboard to include another computer.
 4. If you use OneDrive or an SMB shared folder, the dashboard will update after the files sync.
 5. Open `http://127.0.0.1:8000/usage.html` on any computer to see the combined total and the per-computer breakdown.
 
@@ -141,4 +146,4 @@ Do not commit or share these local files:
 - `adapter_usage.jsonl`
 - `adapter_forwarded_prompt.debug.txt`
 
-Only commit `usage-sync/adapter_usage.<computer-name>.jsonl` to a private repository if you explicitly want Git-based usage aggregation.
+Only commit `usage-sync/adapter_usage*.jsonl` to a private repository if you explicitly want Git-based usage aggregation.

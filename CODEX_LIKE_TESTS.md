@@ -12,7 +12,7 @@
 先启动服务：
 
 ```powershell
-Set-Location "D:\GeminiAPI\Gemini-API"; .\start_ai_server.bat
+$root = git rev-parse --show-toplevel; Set-Location $root; .\start_ai_server.bat
 ```
 
 Cline 配置：
@@ -27,7 +27,7 @@ Model ID: gemini-3-pro
 建议 Cline 打开的工作目录：
 
 ```text
-D:\GeminiAPI\Gemini-API
+the repository root containing `openai_adapter_server.py`
 ```
 
 ## 1. Adapter 自动测试
@@ -35,7 +35,7 @@ D:\GeminiAPI\Gemini-API
 运行：
 
 ```powershell
-Set-Location "D:\GeminiAPI\Gemini-API"; .\test_adapter_openai_compat.ps1
+$root = git rev-parse --show-toplevel; Set-Location $root; .\test_adapter_openai_compat.ps1
 ```
 
 脚本里的测试 prompt 故意使用英文短句，避免 Windows PowerShell 编码导致 JSON 内容被扰动。
@@ -105,7 +105,7 @@ hello adapter
 ```text
 请只执行命令，不要修改任何文件。
 
-在 PowerShell 中进入 D:\GeminiAPI\Gemini-API，执行 Python 语法检查：
+在 PowerShell 中进入仓库根目录，执行 Python 语法检查：
 python -m py_compile openai_adapter_server.py
 
 不要使用 &&。执行后根据 $LASTEXITCODE 告诉我是否通过。
@@ -126,7 +126,7 @@ python -m py_compile openai_adapter_server.py
 ```text
 请只查看 Git 状态，不要修改任何文件，不要 git add，不要 commit，不要 push。
 
-在 D:\GeminiAPI\Gemini-API 执行：
+在仓库根目录执行：
 git status --short
 git diff --stat
 
