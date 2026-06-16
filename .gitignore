@@ -222,4 +222,4 @@ test_cline_write.txt
 !usage-sync/README.md
 !usage-sync/adapter_usage*.jsonl
 提示词*.txt
-usage-sync/adapter_usage.pc-bf8048e9b4.jsonl
+usage-sync/adapter_usage.pc-*.jsonl
