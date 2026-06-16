@@ -10,14 +10,13 @@ This repository contains the local OpenAI-compatible adapter plus the vendored G
 
 Manual fallback:
 
-1. Run `install_adapter_dependencies.bat`.
-2. Copy `adapter_env.example.ps1` to `adapter_env.local.ps1`.
-3. Copy `gemini_cookies.example.json` to `gemini_cookies.local.json`.
+1. Run `scripts\install_adapter_dependencies.bat`.
+2. Copy `examples\adapter_env.example.ps1` to `adapter_env.local.ps1`.
+3. Copy `examples\gemini_cookies.example.json` to `gemini_cookies.local.json`.
 4. Fill `gemini_cookies.local.json` with the company PC browser's Gemini cookies:
    - `__Secure-1PSID`
    - `__Secure-1PSIDTS`
-5. Start the local API with `start_ai_server.bat`.
-6. Open usage dashboard with `open_usage_dashboard.bat`.
+5. Start the local API and open the panel with `START_HERE.bat`.
 
 ## Cline configuration
 
@@ -133,7 +132,7 @@ Recommended setup:
 
 3. If you use Git, commit and pull the `usage-sync/adapter_usage*.jsonl` files when you want the dashboard to include another computer.
 4. If you use OneDrive or an SMB shared folder, the dashboard will update after the files sync.
-5. Open `http://127.0.0.1:8000/usage.html` on any computer to see the combined total and the per-computer breakdown.
+5. Open `http://127.0.0.1:8000/` on any computer to see the combined total and the per-computer breakdown.
 
 The usage files contain timestamps, model names, token estimates, and estimated costs. They do not store prompt or answer text.
 
@@ -143,7 +142,6 @@ Do not commit or share these local files:
 
 - `gemini_cookies.local.json`
 - `adapter_env.local.ps1`
-- `adapter_usage.jsonl`
-- `adapter_forwarded_prompt.debug.txt`
+- `runtime/`
 
 Only commit `usage-sync/adapter_usage*.jsonl` to a private repository if you explicitly want Git-based usage aggregation.

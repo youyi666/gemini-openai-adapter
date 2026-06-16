@@ -5,19 +5,18 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 import webbrowser
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 POWERSHELL = shutil.which("powershell") or "powershell"
 HEALTH_URL = "http://127.0.0.1:8000/health"
 DASHBOARD_URL = "http://127.0.0.1:8000/"
@@ -96,12 +95,18 @@ def local_file_status() -> dict[str, bool]:
 
 
 def get_health(timeout: float = 3.0) -> tuple[bool, dict[str, object] | str]:
+    connection: http.client.HTTPConnection | None = None
     try:
-        with urllib.request.urlopen(HEALTH_URL, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        connection = http.client.HTTPConnection("127.0.0.1", 8000, timeout=timeout)
+        connection.request("GET", "/health", headers={"Host": "127.0.0.1:8000"})
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
         return True, payload
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
         return False, str(exc)
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def show_status() -> None:
@@ -142,7 +147,7 @@ def init_local_files() -> None:
         ("gemini_cookies.example.json", "gemini_cookies.local.json"),
     )
     for source_name, target_name in examples:
-        source = ROOT / source_name
+        source = ROOT / "examples" / source_name
         target = ROOT / target_name
         if target.exists():
             print(f"跳过: {target_name} 已存在")
@@ -159,7 +164,7 @@ def init_local_files() -> None:
 
 def install_dependencies() -> int:
     return run_command(
-        ["cmd", "/c", str(ROOT / "install_adapter_dependencies.bat")],
+        ["cmd", "/c", str(ROOT / "scripts" / "install_adapter_dependencies.bat")],
         title="安装依赖",
     )
 
@@ -168,7 +173,7 @@ def start_server() -> int:
     if not (ROOT / "adapter_env.local.ps1").exists():
         init_local_files()
     return run_command(
-        ["cmd", "/c", str(ROOT / "start_ai_server.bat")],
+        ["cmd", "/c", str(ROOT / "scripts" / "start_ai_server.bat")],
         title="启动本地 OpenAI 兼容服务",
     )
 
@@ -182,7 +187,7 @@ def refresh_cookies() -> int:
     if not (ROOT / "adapter_env.local.ps1").exists():
         init_local_files()
     return powershell(
-        ". .\\adapter_env.local.ps1; .\\repair_auth_with_browser_cdp.ps1 -SkipChatTest",
+        ". .\\adapter_env.local.ps1; .\\scripts\\repair_auth_with_browser_cdp.ps1 -SkipChatTest",
         title="刷新浏览器 Cookie",
     )
 
@@ -193,20 +198,20 @@ def smoke_test() -> int:
         print("服务还没有运行。请先选择“启动服务”，看到 Uvicorn running 后再自测。")
         return 1
     return powershell(
-        ". .\\adapter_env.local.ps1; .\\test_adapter_openai_compat.ps1 -Model gemini-3-flash",
+        ". .\\adapter_env.local.ps1; .\\tests\\test_adapter_openai_compat.ps1 -Model gemini-3-flash",
         title="OpenAI 兼容自测",
     )
 
 
 def export_sync_pack() -> int:
     return powershell(
-        ".\\export_company_sync_pack.ps1",
+        ".\\scripts\\export_company_sync_pack.ps1",
         title="导出公司电脑同步包",
     )
 
 
 def open_docs() -> None:
-    docs = ROOT / "TEAM_QUICK_START.md"
+    docs = ROOT / "docs" / "TEAM_QUICK_START.md"
     if not docs.exists():
         docs = ROOT / "README.md"
     open_path(docs)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import http.client
 import json
 import logging
 import os
@@ -719,7 +720,24 @@ def _looks_like_auth_failure(exc: BaseException, client: GeminiClient | None = N
 def _require_local_request(request: Request) -> None:
     host = request.client.host if request.client else ""
     if host not in {"127.0.0.1", "::1", "localhost"}:
-        raise ValueError("Cookie management endpoints are local-only.")
+        raise ValueError("Admin endpoints are local-only.")
+
+
+def _server_log_path() -> Path:
+    raw_path = os.getenv("OPENAI_ADAPTER_SERVER_LOG_PATH", "").strip()
+    if raw_path:
+        return Path(raw_path)
+    return ROOT / "runtime" / "server.log"
+
+
+def _tail_text_file(path: Path, *, lines: int = 160, max_bytes: int = 120_000) -> str:
+    if not path.exists():
+        return ""
+    data = path.read_bytes()
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+    text = data.decode("utf-8", errors="replace")
+    return "\n".join(text.splitlines()[-max(1, lines):])
 
 
 def _reset_gemini_cookie_cache() -> dict[str, Any]:
@@ -782,7 +800,7 @@ def _cookie_refresh_report_from_file(path: Path, source_hint: str | None = None)
 
 
 def _run_cookie_refresh_script(cookie_path: Path) -> dict[str, Any]:
-    script_path = ROOT / "refresh_gemini_cookies_from_browser.py"
+    script_path = ROOT / "scripts" / "refresh_gemini_cookies_from_browser.py"
     result = subprocess.run(
         [sys.executable, str(script_path), str(cookie_path)],
         cwd=str(ROOT),
@@ -795,6 +813,232 @@ def _run_cookie_refresh_script(cookie_path: Path) -> dict[str, Any]:
         raise RuntimeError(detail or f"Cookie refresh script exited with {result.returncode}.")
     logger.info("Cookie refresh script completed: %s", result.stdout.strip())
     return _cookie_refresh_report_from_file(cookie_path)
+
+
+def _configured_cookie_browser() -> str:
+    browser = os.getenv("OPENAI_ADAPTER_COOKIE_BROWSER", "chrome").strip().lower()
+    aliases = {
+        "": "chrome",
+        "auto": "chrome",
+        "google-chrome": "chrome",
+        "msedge": "edge",
+        "microsoft-edge": "edge",
+    }
+    browser = aliases.get(browser, browser)
+    if browser not in {"chrome", "edge"}:
+        raise RuntimeError(
+            f"Unsupported OPENAI_ADAPTER_COOKIE_BROWSER={browser!r}; use chrome or edge."
+        )
+    return browser
+
+
+def _configured_cookie_profile() -> str:
+    return os.getenv("OPENAI_ADAPTER_COOKIE_PROFILE", "Default").strip() or "Default"
+
+
+def _find_chromium_browser_exe(browser: str) -> Path:
+    if browser == "chrome":
+        exe_name = "chrome.exe"
+        candidates = [
+            Path(os.getenv("ProgramFiles", "")) / "Google" / "Chrome" / "Application" / exe_name,
+            Path(os.getenv("ProgramFiles(x86)", "")) / "Google" / "Chrome" / "Application" / exe_name,
+            Path(os.getenv("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / exe_name,
+        ]
+    else:
+        exe_name = "msedge.exe"
+        candidates = [
+            Path(os.getenv("ProgramFiles(x86)", "")) / "Microsoft" / "Edge" / "Application" / exe_name,
+            Path(os.getenv("ProgramFiles", "")) / "Microsoft" / "Edge" / "Application" / exe_name,
+            Path(os.getenv("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "Application" / exe_name,
+        ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    for directory in os.getenv("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / exe_name
+        if candidate.exists():
+            return candidate
+
+    raise RuntimeError(f"{exe_name} not found.")
+
+
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _wait_for_cdp(port: int, timeout_seconds: int = 30) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+        try:
+            connection.request("GET", "/json/version")
+            response = connection.getresponse()
+            response.read()
+            if response.status == 200:
+                return
+        except OSError as exc:
+            last_error = exc
+        finally:
+            connection.close()
+        time.sleep(1)
+    if last_error is not None:
+        raise RuntimeError(f"Browser CDP did not become ready: {last_error}")
+    raise RuntimeError("Browser CDP did not become ready.")
+
+
+def _stop_dedicated_chrome_profile(user_data_dir: Path) -> None:
+    if os.name != "nt":
+        return
+    escaped = str(user_data_dir).replace("'", "''")
+    command = (
+        f"$dir = '{escaped}'; "
+        "$pattern = [regex]::Escape($dir); "
+        "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+        "Where-Object { $_.CommandLine -match $pattern } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    with suppress(Exception):
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+
+
+def _run_cookie_refresh_cdp_script(
+    cookie_path: Path,
+    *,
+    require_cookie_change: bool = False,
+) -> dict[str, Any]:
+    browser = _configured_cookie_browser()
+    profile = _configured_cookie_profile()
+    browser_exe = _find_chromium_browser_exe(browser)
+    debug_port = _free_local_port()
+    wait_seconds = max(30, _env_int("OPENAI_ADAPTER_COOKIE_CDP_WAIT_SECONDS", 300))
+
+    browser_args = [
+        str(browser_exe),
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={debug_port}",
+        f"--profile-directory={profile}",
+    ]
+    user_data_dir: Path | None = None
+    if browser == "chrome":
+        raw_user_data_dir = os.getenv("OPENAI_ADAPTER_CHROME_USER_DATA_DIR", "").strip()
+        user_data_dir = Path(raw_user_data_dir) if raw_user_data_dir else ROOT / "runtime" / "chrome-gemini-profile"
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        _stop_dedicated_chrome_profile(user_data_dir)
+        browser_args.append(f"--user-data-dir={user_data_dir}")
+
+    browser_args.append("https://gemini.google.com")
+    logger.info(
+        "Starting %s CDP cookie refresh: port=%s profile=%s user_data_dir=%s",
+        browser,
+        debug_port,
+        profile,
+        user_data_dir,
+    )
+    subprocess.Popen(browser_args, cwd=str(ROOT))
+    _wait_for_cdp(debug_port)
+
+    env = os.environ.copy()
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "SSLKEYLOGFILE",
+    ):
+        env.pop(name, None)
+    env["NO_PROXY"] = "localhost,127.0.0.1,::1"
+    env["no_proxy"] = "localhost,127.0.0.1,::1"
+    if require_cookie_change:
+        env["OPENAI_ADAPTER_COOKIE_REQUIRE_CHANGE"] = "1"
+
+    script_path = ROOT / "scripts" / "capture_browser_gemini_cookies_cdp.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script_path),
+            f"http://127.0.0.1:{debug_port}",
+            str(cookie_path),
+            str(wait_seconds),
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=wait_seconds + 60,
+        env=env,
+    )
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode != 0:
+        raise RuntimeError(output or f"CDP cookie refresh exited with {result.returncode}.")
+
+    logger.info("CDP cookie refresh completed: %s", result.stdout.strip())
+    report = _cookie_refresh_report_from_file(cookie_path, "chromium-cdp")
+    report["method"] = "chromium-cdp"
+    report["browser"] = browser
+    report["profile"] = profile
+    report["debug_port"] = debug_port
+    report["required_cookie_change"] = require_cookie_change
+    report["stdout"] = result.stdout.strip()
+    return report
+
+
+def _run_cookie_refresh(
+    cookie_path: Path,
+    require_cookie_change: bool = False,
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    try:
+        report = _run_cookie_refresh_script(cookie_path)
+        report["method"] = "browser-cookie-db"
+        attempts.append({"method": "browser-cookie-db", "ok": True})
+        report["attempts"] = attempts
+        return report
+    except RuntimeError as exc:
+        attempts.append(
+            {
+                "method": "browser-cookie-db",
+                "ok": False,
+                "error": str(exc),
+            }
+        )
+        logger.warning("Browser cookie DB refresh failed; trying CDP fallback: %s", exc)
+        if not _env_bool("OPENAI_ADAPTER_COOKIE_CDP_FALLBACK", True):
+            raise
+
+    try:
+        report = _run_cookie_refresh_cdp_script(
+            cookie_path,
+            require_cookie_change=require_cookie_change,
+        )
+        attempts.append({"method": "chromium-cdp", "ok": True})
+        report["attempts"] = attempts
+        return report
+    except RuntimeError as exc:
+        attempts.append(
+            {
+                "method": "chromium-cdp",
+                "ok": False,
+                "error": str(exc),
+            }
+        )
+        detail = "Cookie refresh failed after all methods:\n" + json.dumps(
+            attempts,
+            ensure_ascii=False,
+            indent=2,
+        )
+        raise RuntimeError(detail) from exc
 
 
 async def _refresh_cookies_and_reload_client(request: Request) -> dict[str, Any]:
@@ -814,7 +1058,11 @@ async def _refresh_cookies_and_reload_client(request: Request) -> dict[str, Any]
         old_status = _account_status_info(old_client)
 
         await _cancel_cookie_writeback_task(request.app)
-        refresh_report = await asyncio.to_thread(_run_cookie_refresh_script, cookie_path)
+        refresh_report = await asyncio.to_thread(
+            _run_cookie_refresh,
+            cookie_path,
+            not old_status["authenticated"],
+        )
         cache_report = _reset_gemini_cookie_cache()
 
         new_client = await _create_gemini_client()
@@ -2021,7 +2269,7 @@ def _get_usage_log_path() -> Path:
     return Path(
         os.getenv(
             "OPENAI_ADAPTER_USAGE_LOG_PATH",
-            str(ROOT / "adapter_usage.jsonl"),
+            str(ROOT / "runtime" / "adapter_usage.jsonl"),
         )
     )
 
@@ -2246,7 +2494,7 @@ def _read_usage_records_from_path(path: Path) -> tuple[list[dict[str, Any]], int
 
     fallback_instance_id = _infer_instance_id_from_path(path)
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             if not line.strip():
                 continue
             try:
@@ -2263,7 +2511,7 @@ def _read_usage_records_from_path(path: Path) -> tuple[list[dict[str, Any]], int
                 record.setdefault("instance_name", _record_instance_label(record))
                 record["_source_file"] = str(path)
                 records.append(record)
-    except OSError:
+    except (OSError, UnicodeError):
         logger.error("Failed to read usage log: %s", path, exc_info=True)
 
     return records, invalid_lines
@@ -2877,6 +3125,9 @@ def _adapter_console_html() -> str:
     }
     .btn {
       appearance: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       border: 1px solid var(--blue);
       background: var(--blue);
       color: #fff;
@@ -2886,6 +3137,7 @@ def _adapter_console_html() -> str:
       font-weight: 700;
       cursor: pointer;
       min-height: 38px;
+      text-decoration: none;
     }
     .btn.secondary {
       background: #fff;
@@ -2958,6 +3210,12 @@ def _adapter_console_html() -> str:
       align-items: center;
       margin-top: 10px;
     }
+    .guide-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -2983,6 +3241,10 @@ def _adapter_console_html() -> str:
       font-family: Consolas, "Courier New", monospace;
       font-size: 12px;
       line-height: 1.55;
+    }
+    .terminal-output {
+      min-height: 260px;
+      max-height: 520px;
     }
     .quick-table {
       width: 100%;
@@ -3155,24 +3417,48 @@ def _adapter_console_html() -> str:
   <header>
     <div>
       <h1>Gemini OpenAI 适配器控制台</h1>
-      <p class="muted">以后只记这个入口：<code>http://127.0.0.1:8000/</code>。这里集中管理状态、Cookie、用量、模型和快速测试。</p>
+      <p class="muted">以后只记一个入口：双击 <code>START_HERE.bat</code>。它会启动服务并打开这个控制台。</p>
     </div>
     <div class="top-actions">
+      <a class="btn secondary" href="/guide.html" target="_blank" rel="noreferrer">入门引导</a>
       <button id="refreshPageBtn" class="btn secondary" type="button">刷新状态</button>
-      <button id="refreshCookieBtn" class="btn" type="button">刷新 Cookie</button>
+      <button id="refreshCookieBtn" class="btn" type="button">刷新登录凭据</button>
     </div>
   </header>
 
   <nav class="nav" aria-label="控制台导航">
+    <a href="#guide">入门引导</a>
     <a href="#status">服务状态</a>
-    <a href="#cookies">Cookie</a>
+    <a href="#terminal">终端输出</a>
+    <a href="#cookies">登录凭据</a>
     <a href="#usage">用量热力图</a>
     <a href="#models">模型</a>
     <a href="#test">快速测试</a>
     <a href="#limit">限流探测</a>
-    <a href="#prompt-size">Prompt 体积</a>
+    <a href="#prompt-size">提示词体积</a>
     <a href="#config">Cline 配置</a>
   </nav>
+
+  <section id="guide" class="section">
+    <div class="split">
+      <div>
+        <h2>入门引导</h2>
+        <p class="muted">日常只双击根目录的 <code>START_HERE.bat</code>。第一次使用时，先确认浏览器里的 Gemini 能正常发消息，再刷新登录凭据，然后运行快速测试。</p>
+        <div class="guide-actions">
+          <a class="btn" href="/guide.html" target="_blank" rel="noreferrer">打开完整入门说明</a>
+          <a class="btn secondary" href="#config">查看 Cline 配置</a>
+          <a class="btn secondary" href="#test">运行快速测试</a>
+          <a class="btn secondary" href="#terminal">查看终端输出</a>
+        </div>
+      </div>
+      <table class="quick-table">
+        <tr><th>第一步</th><td>双击 <code>START_HERE.bat</code></td></tr>
+        <tr><th>控制台</th><td><code>http://127.0.0.1:8000/</code></td></tr>
+        <tr><th>Cline 地址</th><td><code>http://127.0.0.1:8000/v1</code></td></tr>
+        <tr><th>模型</th><td><code>gemini-3-flash</code> 或 <code>gemini-3-pro</code></td></tr>
+      </table>
+    </div>
+  </section>
 
   <section id="status" class="section">
     <h2>服务状态</h2>
@@ -3180,13 +3466,27 @@ def _adapter_console_html() -> str:
     <div id="statusLine" class="status-line"></div>
   </section>
 
+  <section id="terminal" class="section">
+    <div class="split">
+      <div>
+        <h2>终端输出</h2>
+        <p class="muted">这里显示后台服务日志，相当于把启动窗口的关键信息搬到面板里。服务启动失败、Cookie 失效、端口占用、上游错误通常都会出现在这里。</p>
+        <div class="status-line">
+          <button id="terminalRefreshBtn" class="btn secondary" type="button">刷新终端输出</button>
+          <span id="terminalMeta" class="pill">读取中...</span>
+        </div>
+      </div>
+      <pre id="terminalOutput" class="output terminal-output">读取中...</pre>
+    </div>
+  </section>
+
   <section id="cookies" class="section">
     <div class="split">
       <div>
-        <h2>Cookie 管理</h2>
-        <p class="muted">点击按钮会按当前配置从本机 Chrome / Edge 读取 Gemini 登录 Cookie，清理本项目 Cookie 缓存，并热重载 Gemini 客户端。页面只显示 Cookie 是否存在和长度，不显示真实值。</p>
+        <h2>登录凭据管理</h2>
+        <p class="muted">点击按钮会按当前配置从本机 Chrome / Edge 读取 Gemini 登录凭据，清理本项目登录缓存，并热重载 Gemini 客户端。页面只显示凭据是否存在和长度，不显示真实值。</p>
         <div class="status-line">
-          <button id="refreshCookieBtn2" class="btn" type="button">刷新 Cookie 并重载客户端</button>
+          <button id="refreshCookieBtn2" class="btn" type="button">刷新登录凭据并重载客户端</button>
           <a class="pill" href="/health" target="_blank" rel="noreferrer">查看 /health JSON</a>
         </div>
       </div>
@@ -3212,10 +3512,10 @@ def _adapter_console_html() -> str:
     </div>
 
     <h3>按模型统计</h3>
-    <div class="table-wrap"><table class="data"><thead><tr><th>模型</th><th>请求</th><th>输入 Tokens</th><th>输出 Tokens</th><th>总 Tokens</th><th>美元</th><th>人民币</th></tr></thead><tbody id="modelRows"></tbody></table></div>
+    <div class="table-wrap"><table class="data"><thead><tr><th>模型</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>总 Token</th><th>美元</th><th>人民币</th></tr></thead><tbody id="modelRows"></tbody></table></div>
 
     <h3>按电脑统计</h3>
-    <div class="table-wrap"><table class="data"><thead><tr><th>电脑</th><th>请求</th><th>输入 Tokens</th><th>输出 Tokens</th><th>总 Tokens</th><th>美元</th><th>人民币</th></tr></thead><tbody id="instanceRows"></tbody></table></div>
+    <div class="table-wrap"><table class="data"><thead><tr><th>电脑</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>总 Token</th><th>美元</th><th>人民币</th></tr></thead><tbody id="instanceRows"></tbody></table></div>
 
     <h3>最近请求</h3>
     <div class="table-wrap"><table class="data"><thead><tr><th>时间</th><th>电脑</th><th>请求模型</th><th>实际模型</th><th>流式</th><th>Tokens</th><th>人民币</th></tr></thead><tbody id="recentRows"></tbody></table></div>
@@ -3293,7 +3593,7 @@ def _adapter_console_html() -> str:
   <section id="prompt-size" class="section">
     <div class="split">
       <div>
-        <h2>Prompt 体积探测</h2>
+        <h2>提示词体积探测</h2>
         <p class="muted">逐档增加单次输入 prompt 的估算 tokens，用来观察“一个任务最多能塞多少上下文”。每档只发 1 次请求，并要求模型只回复 OK。</p>
         <p class="hint">这会真实消耗输入 tokens。建议先跑“标准体积”到 32k；如果全成功，再跑“摸边界体积”到 64k，最后才考虑专家体积到 128k。</p>
         <div class="form-grid">
@@ -3328,8 +3628,8 @@ def _adapter_console_html() -> str:
     <h2>Cline / Continue 配置速查</h2>
     <table class="quick-table">
       <tbody>
-        <tr><th>Base URL</th><td><code>http://127.0.0.1:8000/v1</code></td></tr>
-        <tr><th>API Key</th><td><code>dummy</code> 或任意非空字符串</td></tr>
+        <tr><th>接口地址</th><td><code>http://127.0.0.1:8000/v1</code></td></tr>
+        <tr><th>接口密钥</th><td><code>dummy</code> 或任意非空字符串</td></tr>
         <tr><th>稳妥模型</th><td><code>gemini-3-flash</code></td></tr>
         <tr><th>更强模型</th><td><code>gemini-3-pro</code>，复杂任务建议拆小一点，遇到 429 先切回 Flash</td></tr>
         <tr><th>健康检查</th><td><code>Invoke-RestMethod http://127.0.0.1:8000/health | ConvertTo-Json -Depth 5</code></td></tr>
@@ -3342,6 +3642,15 @@ def _adapter_console_html() -> str:
 const pricingSourceUrl = "__PRICING_SOURCE_URL__";
 const $ = (id) => document.getElementById(id);
 const fmt = new Intl.NumberFormat("zh-CN");
+const dateTimeFmt = new Intl.DateTimeFormat("zh-CN", {
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -3357,15 +3666,67 @@ function money(value, prefix) {
   return `${prefix}${num.toFixed(6)}`;
 }
 
-function setBusy(isBusy) {
-  ["refreshPageBtn", "refreshCookieBtn", "refreshCookieBtn2", "probeBtn", "rateLimitBtn", "promptSizeBtn"].forEach((id) => {
+function localDateTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const parts = Object.fromEntries(
+    dateTimeFmt.formatToParts(date).map((part) => [part.type, part.value])
+  );
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function displayValue(value) {
+  const text = String(value ?? "");
+  const map = {
+    ok: "正常",
+    initialized: "已初始化",
+    UNKNOWN: "未知",
+    unknown: "未知",
+    AVAILABLE: "可用",
+    UNAUTHENTICATED: "未认证",
+    auto: "自动",
+    chrome: "Chrome",
+    edge: "Edge",
+  };
+  return map[text] || text;
+}
+
+function setButtonsDisabled(ids, isDisabled) {
+  ids.forEach((id) => {
     const el = $(id);
-    if (el) el.disabled = isBusy;
+    if (el) el.disabled = isDisabled;
   });
 }
 
-async function fetchJson(url, options) {
-  const response = await fetch(url, options);
+function setBusy(isBusy) {
+  setButtonsDisabled(["refreshPageBtn", "probeBtn", "rateLimitBtn", "promptSizeBtn"], isBusy);
+}
+
+function setCookieBusy(isBusy) {
+  ["refreshCookieBtn", "refreshCookieBtn2"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    if (!el.dataset.originalText) el.dataset.originalText = el.textContent;
+    el.disabled = isBusy;
+    el.textContent = isBusy ? "刷新中..." : el.dataset.originalText;
+  });
+}
+
+async function fetchJson(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`请求超时：${url}`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
   const text = await response.text();
   let data;
   try {
@@ -3393,14 +3754,14 @@ async function loadHealth() {
   const status = data.account_status || {};
   const authClass = status.authenticated ? "ok" : "bad";
   $("statusCards").innerHTML = [
-    metric("服务", data.status || "unknown", data.status === "ok" ? "ok" : "bad"),
-    metric("Gemini 客户端", data.gemini_client || "unknown", data.gemini_client === "initialized" ? "ok" : "bad"),
-    metric("账号状态", status.name || "UNKNOWN", authClass),
-    metric("已认证", status.authenticated ? "true" : "false", authClass),
-    metric("Cookie 写回", data.cookie_writeback?.enabled ? "已启用" : "未启用", data.cookie_writeback?.enabled ? "ok" : "warn"),
+    metric("服务", displayValue(data.status || "unknown"), data.status === "ok" ? "ok" : "bad"),
+    metric("Gemini 客户端", displayValue(data.gemini_client || "unknown"), data.gemini_client === "initialized" ? "ok" : "bad"),
+    metric("账号状态", displayValue(status.name || "UNKNOWN"), authClass),
+    metric("已认证", status.authenticated ? "是" : "否", authClass),
+    metric("登录凭据写回", data.cookie_writeback?.enabled ? "已启用" : "未启用", data.cookie_writeback?.enabled ? "ok" : "warn"),
     metric("写回间隔", `${data.cookie_writeback?.interval_seconds ?? "-"} 秒`),
-    metric("Cookie 浏览器", data.cookie_refresh?.browser || "auto"),
-    metric("Cookie Profile", data.cookie_refresh?.profile || "Default"),
+    metric("登录浏览器", displayValue(data.cookie_refresh?.browser || "auto")),
+    metric("浏览器配置档", data.cookie_refresh?.profile || "默认配置"),
   ].join("");
   $("statusLine").innerHTML = `
     <span class="pill ${status.authenticated ? "ok" : "bad"}">${escapeHtml(status.description || "无状态说明")}</span>
@@ -3461,7 +3822,7 @@ async function loadUsage() {
   $("usageNote").innerHTML = `本页按 Google Gemini API 官方付费档做本地估算，不是 Gemini 网页版真实账单。价格来源：<a href="${escapeHtml(data.pricing_source || pricingSourceUrl)}" target="_blank" rel="noreferrer">官方价格页</a>`;
   $("usageCards").innerHTML = [
     metric("请求次数", fmt.format(totals.requests || 0)),
-    metric("总 Tokens", fmt.format(totals.total_tokens || 0)),
+    metric("总 Token", fmt.format(totals.total_tokens || 0)),
     metric("估算美元", money(totals.cost_usd, "$")),
     metric("估算人民币", money(totals.cost_cny, "¥")),
     metric("电脑数量", fmt.format(Object.keys(data.by_instance || {}).length)),
@@ -3483,8 +3844,8 @@ async function loadUsage() {
     const usage = record.usage || {};
     const cost = record.cost_estimate || {};
     return `<tr>
-      <td>${escapeHtml(record.timestamp || "")}</td>
-      <td>${escapeHtml(record.instance_name || record.host || record.instance_id || "unknown")}</td>
+      <td title="${escapeHtml(record.timestamp || "")}">${escapeHtml(localDateTime(record.timestamp))}</td>
+      <td>${escapeHtml(record.instance_name || record.host || record.instance_id || "未知")}</td>
       <td>${escapeHtml(record.requested_model || "")}</td>
       <td>${escapeHtml(record.gemini_model || "")}</td>
       <td>${record.stream ? "是" : "否"}</td>
@@ -3508,21 +3869,34 @@ async function loadModels() {
     : `<span class="muted">暂无模型列表。</span>`;
 }
 
+async function loadTerminalLog() {
+  try {
+    const data = await fetchJson("/admin/server-log?lines=180", {}, 8000);
+    $("terminalOutput").textContent = data.text || "暂无终端输出。";
+    $("terminalMeta").textContent = data.exists
+      ? `日志：${data.path}`
+      : `日志文件尚未生成：${data.path}`;
+  } catch (error) {
+    $("terminalOutput").textContent = String(error);
+    $("terminalMeta").textContent = "读取失败";
+  }
+}
+
 async function refreshAll() {
-  await Promise.allSettled([loadHealth(), loadUsage(), loadModels()]);
+  await Promise.allSettled([loadHealth(), loadUsage(), loadModels(), loadTerminalLog()]);
 }
 
 async function refreshCookies() {
-  setBusy(true);
-  $("cookieOutput").textContent = "正在刷新 Cookie、清理缓存并重载 Gemini 客户端...";
+  setCookieBusy(true);
+  $("cookieOutput").textContent = `${localDateTime(new Date().toISOString())} 已开始刷新登录凭据。\n\n如果普通读取 Chrome Cookie 失败，系统会自动打开专用 Chrome 登录窗口。\n如果看到 Gemini 登录页，请在那个窗口完成登录。\n如果窗口里看起来已登录但本面板仍在等待，请在那个窗口退出重登，或发送一条 Gemini 消息，让 Google 刷新 Cookie。\n\n这个过程可能需要几分钟；面板其他按钮现在仍然可以使用。`;
   try {
-    const data = await fetchJson("/admin/refresh-cookies", { method: "POST" });
+    const data = await fetchJson("/admin/refresh-cookies", { method: "POST" }, 360000);
     $("cookieOutput").textContent = JSON.stringify(data, null, 2);
     await refreshAll();
   } catch (error) {
     $("cookieOutput").textContent = String(error);
   } finally {
-    setBusy(false);
+    setCookieBusy(false);
   }
 }
 
@@ -3538,7 +3912,7 @@ async function runProbe() {
         stream: false,
         messages: [{ role: "user", content: "用一句话回复：adapter 正常。" }],
       }),
-    });
+    }, 120000);
     $("probeOutput").textContent = JSON.stringify(data, null, 2);
     await loadUsage();
   } catch (error) {
@@ -3712,7 +4086,7 @@ async function runRateLimitTest() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    });
+    }, 900000);
     $("rateLimitOutput").textContent = formatRateLimitReport(data);
     await loadUsage();
     await loadHealth();
@@ -3730,12 +4104,12 @@ async function runPromptSizeTest() {
   const capped = plan.plan.filter((tokens) => tokens <= maxTokens);
   const effective = capped.length ? capped : [Math.min(maxTokens, plan.plan[0])];
   const confirmed = window.confirm(
-    `Prompt 体积探测会真实调用 Gemini，并消耗大量输入 tokens。${plan.label} 将测试 ${effective.map(formatCompactTokens).join(" -> ")}。确定开始吗？`
+    `提示词体积探测会真实调用 Gemini，并消耗大量输入 token。${plan.label} 将测试 ${effective.map(formatCompactTokens).join(" -> ")}。确定开始吗？`
   );
   if (!confirmed) return;
 
   setBusy(true);
-  $("promptSizeOutput").textContent = "正在进行 Prompt 体积探测，请不要重复点击...";
+  $("promptSizeOutput").textContent = "正在进行提示词体积探测，请不要重复点击...";
   try {
     const payload = {
       model: $("promptSizeModel")?.value || "gemini-3-flash",
@@ -3748,7 +4122,7 @@ async function runPromptSizeTest() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    });
+    }, 1800000);
     $("promptSizeOutput").textContent = formatPromptSizeReport(data);
     await loadUsage();
     await loadHealth();
@@ -3763,6 +4137,7 @@ $("refreshPageBtn").addEventListener("click", refreshAll);
 $("refreshCookieBtn").addEventListener("click", refreshCookies);
 $("refreshCookieBtn2").addEventListener("click", refreshCookies);
 $("probeBtn").addEventListener("click", runProbe);
+$("terminalRefreshBtn").addEventListener("click", loadTerminalLog);
 $("rateLimitBtn").addEventListener("click", runRateLimitTest);
 $("limitMode").addEventListener("change", updateRateLimitMode);
 $("limitProfile").addEventListener("change", updateRateLimitMode);
@@ -3788,6 +4163,108 @@ async def adapter_console() -> HTMLResponse:
 @app.get("/dashboard.html", response_class=HTMLResponse)
 async def adapter_console_alias() -> HTMLResponse:
     return HTMLResponse(_adapter_console_html())
+
+
+@app.get("/guide.html", response_class=HTMLResponse)
+async def quickstart_guide() -> HTMLResponse:
+    guide_path = ROOT / "docs" / "TEAM_QUICK_START.md"
+    if guide_path.exists():
+        guide_text = guide_path.read_text(encoding="utf-8", errors="replace")
+    else:
+        guide_text = (ROOT / "README.md").read_text(encoding="utf-8", errors="replace")
+    body = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemini Adapter 入门引导</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      color: #172033;
+      background: #f5f7fb;
+    }}
+    main {{
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 24px 16px 48px;
+    }}
+    a {{ color: #155eef; text-decoration: none; }}
+    .top {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 16px;
+    }}
+    .btn {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 36px;
+      padding: 8px 12px;
+      border: 1px solid #155eef;
+      border-radius: 7px;
+      background: #155eef;
+      color: #fff;
+      font-weight: 700;
+    }}
+    pre {{
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border: 1px solid #d7dde8;
+      border-radius: 8px;
+      background: #fff;
+      padding: 16px;
+      line-height: 1.7;
+      font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      font-size: 14px;
+    }}
+  </style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <h1>入门引导</h1>
+    <a class="btn" href="/">返回控制台</a>
+  </div>
+  <pre>{html.escape(guide_text)}</pre>
+</main>
+</body>
+</html>"""
+    return HTMLResponse(body)
+
+
+@app.get("/admin/server-log")
+async def server_log_tail(request: Request, lines: int = 160) -> JSONResponse:
+    try:
+        _require_local_request(request)
+        safe_lines = min(max(int(lines), 20), 500)
+        path = _server_log_path()
+        text = _tail_text_file(path, lines=safe_lines)
+        return JSONResponse(
+            {
+                "path": str(path),
+                "exists": path.exists(),
+                "lines": safe_lines,
+                "text": text,
+            }
+        )
+    except ValueError as exc:
+        return _openai_error_response(
+            403,
+            str(exc),
+            error_type="forbidden",
+            code="local_only",
+        )
+    except Exception as exc:
+        logger.error("Failed to read server log.", exc_info=True)
+        return _openai_error_response(
+            500,
+            f"Failed to read server log: {exc}",
+            error_type="server_error",
+            code="server_log_error",
+        )
 
 
 @app.get("/health")
@@ -3923,7 +4400,7 @@ async def cookie_dashboard(request: Request) -> HTMLResponse:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Gemini Cookie 管理</title>
+  <title>Gemini 登录凭据管理</title>
   <style>
     :root {{
       color-scheme: light;
@@ -4022,8 +4499,8 @@ async def cookie_dashboard(request: Request) -> HTMLResponse:
 </head>
 <body>
 <main>
-  <h1>Gemini Cookie 管理</h1>
-  <p class="muted">从本机可读取的 Chrome / Edge Cookie 数据库刷新 Gemini 登录态，并在不中断 Web 服务的情况下重载 Gemini 客户端。页面不会显示 Cookie 值。</p>
+  <h1>Gemini 登录凭据管理</h1>
+  <p class="muted">从本机可读取的 Chrome / Edge 登录凭据数据库刷新 Gemini 登录态，并在不中断 Web 服务的情况下重载 Gemini 客户端。页面不会显示真实凭据值。</p>
 
   <section class="panel">
     <div class="grid">
@@ -4036,7 +4513,7 @@ async def cookie_dashboard(request: Request) -> HTMLResponse:
         <div id="authenticated" class="value {'ok' if account_status['authenticated'] else 'bad'}">{str(account_status['authenticated']).lower()}</div>
       </div>
       <div class="metric">
-        <div class="label">Cookie 文件</div>
+        <div class="label">凭据文件</div>
         <div class="value"><code>{html.escape(str(cookie_path or '未配置'))}</code></div>
       </div>
       <div class="metric">
@@ -4045,7 +4522,7 @@ async def cookie_dashboard(request: Request) -> HTMLResponse:
       </div>
     </div>
     <p>
-      <button id="refreshBtn" type="button">刷新 Cookie 并重载客户端</button>
+      <button id="refreshBtn" type="button">刷新登录凭据并重载客户端</button>
       <a href="/usage.html" style="margin-left: 12px;">查看用量</a>
     </p>
   </section>
@@ -4075,7 +4552,7 @@ async function loadHealth() {{
 
 button.addEventListener("click", async () => {{
   button.disabled = true;
-  output.textContent = "正在刷新 Cookie、清理缓存并重载 Gemini 客户端...";
+  output.textContent = "正在刷新登录凭据、清理缓存并重载 Gemini 客户端...";
   try {{
     const response = await fetch("/admin/refresh-cookies", {{ method: "POST" }});
     const data = await response.json();

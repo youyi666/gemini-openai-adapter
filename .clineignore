@@ -11,6 +11,7 @@ local_settings.py
 adapter_usage*.jsonl
 adapter_forwarded_prompt.debug.txt
 adapter_test_*.json
+runtime/
 usage-sync/adapter_usage*.jsonl
 test_cline_write.txt
 *.log

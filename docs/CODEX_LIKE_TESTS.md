@@ -12,7 +12,7 @@
 先启动服务：
 
 ```powershell
-$root = git rev-parse --show-toplevel; Set-Location $root; .\start_ai_server.bat
+$root = git rev-parse --show-toplevel; Set-Location $root; .\START_HERE.bat
 ```
 
 Cline 配置：
@@ -35,7 +35,7 @@ the repository root containing `openai_adapter_server.py`
 运行：
 
 ```powershell
-$root = git rev-parse --show-toplevel; Set-Location $root; .\test_adapter_openai_compat.ps1
+$root = git rev-parse --show-toplevel; Set-Location $root; .\tests\test_adapter_openai_compat.ps1
 ```
 
 脚本里的测试 prompt 故意使用英文短句，避免 Windows PowerShell 编码导致 JSON 内容被扰动。
@@ -215,7 +215,7 @@ $env:OPENAI_ADAPTER_STREAM_FALLBACK_MODEL = "gemini-3-flash"
 ```text
 请只分析，不要修改文件。
 
-请阅读当前项目的 README.md、COMPANY_SYNC_README.md 和 openai_adapter_server.py 中与 streaming 有关的函数，
+请阅读当前项目的 README.md、docs/COMPANY_SYNC_README.md 和 openai_adapter_server.py 中与 streaming 有关的函数，
 总结这个 adapter 如何把 Gemini 流式输出转换成 OpenAI SSE。
 ```
 

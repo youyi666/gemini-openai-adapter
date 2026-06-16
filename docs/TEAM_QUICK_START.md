@@ -16,12 +16,10 @@ IDE 插件把它当成 OpenAI API 调用，实际请求会由本项目转发到 
 
 1. 克隆或解压项目到本机。
 2. 双击 `START_HERE.bat`。
-3. 在菜单里先选 `2. 初始化本地配置文件`。
-4. 再选 `3. 安装/更新依赖`。
-5. 确认 Chrome 里的 Gemini 网页可以正常发送消息。
-6. 回到菜单选 `6. 刷新浏览器 Cookie`。
-7. 选 `4. 启动服务`，看到 `Uvicorn running on http://127.0.0.1:8000` 表示服务已启动。
-8. 新开一个菜单窗口，选 `7. 运行兼容自测`。
+3. 浏览器会自动打开控制台 `http://127.0.0.1:8000/`。
+4. 确认 Chrome 里的 Gemini 网页可以正常发送消息。
+5. 回到控制台点击 `刷新登录凭据`。
+6. 在控制台点击 `快速测试`，确认可以收到回复。
 
 自测通过后，就可以配置 IDE 插件。
 
@@ -51,9 +49,9 @@ Base URL: http://127.0.0.1:8000
 ## 日常使用顺序
 
 1. 双击 `START_HERE.bat`。
-2. 选 `4. 启动服务`。
+2. 控制台会自动打开。
 3. 打开 Cline 或 Continue.dev 使用。
-4. 想看用量、Cookie 状态、测试工具时，选 `5. 打开控制台`。
+4. 想看用量、Cookie 状态、测试工具、终端输出，都在控制台里看。
 
 ## 常见问题
 
@@ -74,8 +72,8 @@ Base URL: http://127.0.0.1:8000
 处理顺序：
 
 1. 先打开 Gemini 网页端，手动发一句话，确认网页本身可用。
-2. 回到菜单选 `6. 刷新浏览器 Cookie`。
-3. 重启服务。
+2. 回到控制台点击 `刷新登录凭据`。
+3. 如仍失败，关闭旧服务后重新双击 `START_HERE.bat`。
 4. 打开控制台看账号状态是否变成 `AVAILABLE`。
 
 ### Cline 报 prompt too large
@@ -90,7 +88,7 @@ Base URL: http://127.0.0.1:8000
 
 ### Cline 一直思考但没有输出
 
-先打开控制台看 `/health` 是否正常，再运行菜单里的兼容自测。
+先打开控制台看 `/health` 是否正常，再点击控制台里的快速测试。
 
 如果自测通过，通常是当前 Cline 任务上下文太大或模型在重试；新开任务会更稳。
 
@@ -101,9 +99,7 @@ Base URL: http://127.0.0.1:8000
 ```text
 adapter_env.local.ps1
 gemini_cookies.local.json
-adapter_usage.jsonl
-adapter_forwarded_prompt.debug.txt
-.gemini_cookie_cache/
+runtime/
 dist/
 ```
 
@@ -111,6 +107,6 @@ dist/
 
 ## 给维护者的提醒
 
-- 改功能后先运行 `python -m py_compile openai_adapter_server.py refresh_gemini_cookies_from_browser.py capture_browser_gemini_cookies_cdp.py capture_edge_gemini_cookies_cdp.py team_menu.py`。
-- 再启动服务，运行 `test_adapter_openai_compat.ps1`。
+- 改功能后先运行 `python -m py_compile openai_adapter_server.py scripts\refresh_gemini_cookies_from_browser.py scripts\capture_browser_gemini_cookies_cdp.py scripts\capture_edge_gemini_cookies_cdp.py scripts\team_menu.py`。
+- 再启动服务，运行 `tests\test_adapter_openai_compat.ps1`。
 - 推送前确认 `git status --short` 里没有 Cookie、本地配置、用量日志。

@@ -2,9 +2,9 @@
 chcp 65001 >nul
 title Gemini OpenAI Adapter
 cd /d "%~dp0"
-python "%~dp0team_menu.py"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\launch_adapter.ps1"
 if errorlevel 1 (
   echo.
-  echo Python 启动失败。请先安装 Python 3.10+，然后重新运行本文件。
+  echo Start failed. Check Python 3.10+ and runtime\server.log.
   pause
 )

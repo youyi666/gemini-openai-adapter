@@ -15,7 +15,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 AUTH_COOKIE_NAMES = (
     "__Secure-1PSID",
     "__Secure-1PSIDTS",

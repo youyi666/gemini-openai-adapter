@@ -1,6 +1,6 @@
 @echo off
 title Install Gemini Adapter Dependencies
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 echo Installing Gemini OpenAI Adapter and browser cookie helpers...
 python -m pip install -e ".[browser]"
 if errorlevel 1 (
@@ -10,5 +10,5 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Done. Copy adapter_env.example.ps1 to adapter_env.local.ps1 and gemini_cookies.example.json to gemini_cookies.local.json, then start the server.
+echo Done. Copy examples\adapter_env.example.ps1 to adapter_env.local.ps1 and examples\gemini_cookies.example.json to gemini_cookies.local.json, then start the server.
 pause

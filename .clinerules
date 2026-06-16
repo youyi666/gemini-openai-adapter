@@ -9,7 +9,7 @@
 - Do not intentionally read or send full-project context, huge logs, generated files, caches, or repeated file contents when the task can be solved with targeted file reads.
 - For tasks that may exceed 32k prompt tokens, split the work into smaller phases, summarize findings, and continue with only the next relevant files.
 - If the user explicitly requests a larger-context experiment, warn that it may fail and ask before exceeding the 32k budget.
-- Never read, write, summarize, or commit secrets and local logs: `gemini_cookies.local.json`, `adapter_env.local.ps1`, `adapter_usage*.jsonl`, `adapter_forwarded_prompt.debug.txt`, `.env*`, or files containing token/password/secret/cookie values.
+- Never read, write, summarize, or commit secrets and local logs: `gemini_cookies.local.json`, `adapter_env.local.ps1`, `runtime/`, `adapter_usage*.jsonl`, `adapter_forwarded_prompt.debug.txt`, `.env*`, or files containing token/password/secret/cookie values.
 - For existing files, read the relevant current content first and use `replace_in_file` for localized edits. Use `write_to_file` only for new files or complete small-file rewrites.
 - If the user asks to run a command, inspect Git status, or explain code, do not modify files.
 - Do not write user instructions, command text, XML tool tags, or surrounding chat text into project files unless the user explicitly says that exact text is desired file content.

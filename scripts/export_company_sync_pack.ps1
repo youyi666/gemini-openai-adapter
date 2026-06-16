@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $scriptDir
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $outDir = Join-Path $root "dist"
 $stage = Join-Path $outDir "gemini-openai-adapter-sync"
@@ -16,19 +17,7 @@ $files = @(
     "LICENSE",
     "pyproject.toml",
     "openai_adapter_server.py",
-    "refresh_gemini_cookies_from_browser.py",
-    "capture_browser_gemini_cookies_cdp.py",
-    "capture_edge_gemini_cookies_cdp.py",
-    "team_menu.py",
     "START_HERE.bat",
-    "start_ai_server.bat",
-    "open_usage_dashboard.bat",
-    "install_adapter_dependencies.bat",
-    "adapter_env.example.ps1",
-    "gemini_cookies.example.json",
-    "export_company_sync_pack.ps1",
-    "repair_auth_with_browser_cdp.ps1",
-    "repair_auth_with_edge_cdp.ps1",
     ".clinerules",
     ".clineignore",
     ".gitattributes",
@@ -36,13 +25,17 @@ $files = @(
 )
 
 foreach ($file in $files) {
-    Copy-Item -LiteralPath (Join-Path $root $file) -Destination (Join-Path $stage $file) -Force
+    $source = Join-Path $root $file
+    $destination = Join-Path $stage $file
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -LiteralPath $source -Destination $destination -Force
 }
 
-Get-ChildItem -LiteralPath $root -File -Filter "*.md" |
-    ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stage $_.Name) -Force
-    }
+Copy-Item -LiteralPath (Join-Path $root "README.md") -Destination (Join-Path $stage "README.md") -Force
+Copy-Item -LiteralPath (Join-Path $root "scripts") -Destination $stage -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $root "docs") -Destination $stage -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $root "examples") -Destination $stage -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $root "tests") -Destination $stage -Recurse -Force
 
 $srcDir = Join-Path $stage "src"
 New-Item -ItemType Directory -Force -Path $srcDir | Out-Null

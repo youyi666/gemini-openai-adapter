@@ -42,10 +42,6 @@ Repository = "https://github.com/youyi666/gemini-openai-adapter"
 [tool.setuptools]
 py-modules = [
     "openai_adapter_server",
-    "refresh_gemini_cookies_from_browser",
-    "capture_browser_gemini_cookies_cdp",
-    "capture_edge_gemini_cookies_cdp",
-    "team_menu",
 ]
 
 [tool.setuptools.packages.find]

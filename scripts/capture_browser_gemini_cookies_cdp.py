@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 AUTH_COOKIE_NAMES = (
     "__Secure-1PSID",
     "__Secure-1PSIDTS",
@@ -81,11 +81,56 @@ def _resolve_cdp_endpoint(endpoint: str) -> str:
     return websocket_url
 
 
+def _load_existing_auth_values(output_path: Path) -> dict[str, str]:
+    if not output_path.exists():
+        return {}
+    try:
+        raw = json.loads(output_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if isinstance(raw, dict) and isinstance(raw.get("cookies"), dict):
+        return {
+            name: value
+            for name, value in raw["cookies"].items()
+            if name in AUTH_COOKIE_NAMES and isinstance(value, str) and value
+        }
+    if isinstance(raw, dict):
+        return {
+            name: value
+            for name, value in raw.items()
+            if name in AUTH_COOKIE_NAMES and isinstance(value, str) and value
+        }
+    return {}
+
+
+def _extract_auth_values(cookies: list[dict[str, object]]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for cookie in cookies:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if name in AUTH_COOKIE_NAMES and isinstance(value, str) and value:
+            values[name] = value
+    return values
+
+
+def _changed_from_previous(values: dict[str, str], previous: dict[str, str]) -> bool:
+    if not previous:
+        return True
+    return any(values.get(name) and values.get(name) != previous.get(name) for name in AUTH_COOKIE_NAMES)
+
+
 def main() -> int:
     _disable_process_proxy_for_local_cdp()
     endpoint = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9222"
     output_path = Path(sys.argv[2]) if len(sys.argv) > 2 else ROOT / "gemini_cookies.local.json"
     wait_seconds = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    require_change = os.getenv("OPENAI_ADAPTER_COOKIE_REQUIRE_CHANGE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    previous_values = _load_existing_auth_values(output_path) if require_change else {}
     cdp_endpoint = _resolve_cdp_endpoint(endpoint)
 
     with sync_playwright() as p:
@@ -104,24 +149,35 @@ def main() -> int:
             while True:
                 page.wait_for_timeout(3000)
                 cookies = context.cookies(COOKIE_URLS)
-                if any(cookie.get("name") == "__Secure-1PSID" for cookie in cookies):
+                current_values = _extract_auth_values(cookies)
+                if "__Secure-1PSID" in current_values and (
+                    not require_change or _changed_from_previous(current_values, previous_values)
+                ):
                     break
                 if time.monotonic() >= deadline:
                     break
-                print("Waiting for Gemini login cookies from browser CDP...")
+                if require_change and "__Secure-1PSID" in current_values:
+                    print(
+                        "Existing Gemini cookies are still unchanged. "
+                        "Because the adapter is unauthenticated, sign in again or send a Gemini message in the opened browser."
+                    )
+                else:
+                    print("Waiting for Gemini login cookies from browser CDP...")
         finally:
             browser.close()
 
-    values: dict[str, str] = {}
-    for cookie in cookies:
-        name = cookie.get("name")
-        value = cookie.get("value")
-        if name in AUTH_COOKIE_NAMES and isinstance(value, str) and value:
-            values[name] = value
+    values = _extract_auth_values(cookies)
 
     if "__Secure-1PSID" not in values:
         print("Browser CDP did not return __Secure-1PSID. Is Gemini logged in?")
         return 2
+
+    if require_change and not _changed_from_previous(values, previous_values):
+        print(
+            "Browser CDP only found the same cookies that were already unauthenticated. "
+            "Please sign out/in or send a Gemini message in the opened browser, then try again."
+        )
+        return 3
 
     if "__Secure-1PSIDTS" not in values:
         print("Warning: Browser CDP did not return __Secure-1PSIDTS; writing available auth cookies.")

@@ -7,7 +7,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent $ScriptDir
 Set-Location $Root
 if (Test-Path ".\adapter_env.local.ps1") {
     . .\adapter_env.local.ps1
@@ -75,7 +76,7 @@ if ($browser -eq "chrome") {
         $env:OPENAI_ADAPTER_CHROME_USER_DATA_DIR
     }
     else {
-        Join-Path $Root ".chrome-gemini-profile"
+        Join-Path $Root "runtime\chrome-gemini-profile"
     }
     New-Item -ItemType Directory -Force -Path $chromeUserDataDir | Out-Null
 
@@ -131,7 +132,7 @@ if ($null -eq $version) {
 Write-Step "Capture cookies from $browserName CDP"
 $env:NO_PROXY = "localhost,127.0.0.1,::1"
 $env:no_proxy = "localhost,127.0.0.1,::1"
-python .\capture_browser_gemini_cookies_cdp.py "http://127.0.0.1:$DebugPort" ".\gemini_cookies.local.json" 300
+python .\scripts\capture_browser_gemini_cookies_cdp.py "http://127.0.0.1:$DebugPort" ".\gemini_cookies.local.json" 300
 if ($LASTEXITCODE -ne 0) {
     throw "Could not capture Gemini auth cookies from $browserName CDP."
 }
@@ -146,7 +147,7 @@ $repairArgs = @{
 if ($SkipChatTest) {
     $repairArgs["SkipChatTest"] = $true
 }
-& .\repair_adapter_auth_and_test.ps1 @repairArgs
+& .\scripts\repair_adapter_auth_and_test.ps1 @repairArgs
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }

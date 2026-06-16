@@ -1,10 +1,10 @@
 @echo off
 title Local AI Codex Server
 echo Starting Gemini Proxy Server...
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 if not exist "adapter_env.local.ps1" (
   echo Missing adapter_env.local.ps1
-  echo Copy adapter_env.example.ps1 to adapter_env.local.ps1 first.
+  echo Copy examples\adapter_env.example.ps1 to adapter_env.local.ps1 first.
   pause
   exit /b 1
 )

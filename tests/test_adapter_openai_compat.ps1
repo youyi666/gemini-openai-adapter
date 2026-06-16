@@ -74,6 +74,7 @@ try {
         --silent `
         --show-error `
         --no-buffer `
+        --noproxy "*" `
         -H "Content-Type: application/json" `
         --data-binary "@$bodyFile" `
         "${BaseUrl}/v1/chat/completions" 2>&1

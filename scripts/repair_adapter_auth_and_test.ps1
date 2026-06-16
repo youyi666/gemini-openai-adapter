@@ -10,7 +10,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Split-Path -Parent $ScriptDir
 Set-Location $Root
 
 function Write-Step {
@@ -46,14 +47,14 @@ function Get-Health {
 Write-Step "Load local environment"
 . .\adapter_env.local.ps1
 if (-not $env:GEMINI_COOKIE_PATH) {
-    $env:GEMINI_COOKIE_PATH = Join-Path $Root ".gemini_cookie_cache"
+    $env:GEMINI_COOKIE_PATH = Join-Path $Root "runtime\gemini_cookie_cache"
 }
 Write-Host "Cookie JSON: $env:GEMINI_COOKIES_JSON"
 Write-Host "Cookie cache: $env:GEMINI_COOKIE_PATH"
 
 if (-not $SkipBrowserRefresh) {
     Write-Step "Refresh cookies from browser if possible"
-    python .\refresh_gemini_cookies_from_browser.py $env:GEMINI_COOKIES_JSON
+    python .\scripts\refresh_gemini_cookies_from_browser.py $env:GEMINI_COOKIES_JSON
     $refreshExit = $LASTEXITCODE
     if ($refreshExit -eq 0) {
         Write-Host "Browser cookie refresh succeeded."
