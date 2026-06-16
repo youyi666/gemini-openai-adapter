@@ -209,6 +209,7 @@ cookies.json
 *.cookies
 gemini_cookies.local.json
 adapter_env.local.ps1
+adapter_env.local.sh
 runtime/
 .gemini_cookie_cache/
 .chrome-gemini-profile/

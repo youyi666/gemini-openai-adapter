@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -837,31 +838,53 @@ def _configured_cookie_profile() -> str:
 
 
 def _find_chromium_browser_exe(browser: str) -> Path:
+    candidates: list[Path] = []
+    executable_names: list[str] = []
+
     if browser == "chrome":
-        exe_name = "chrome.exe"
-        candidates = [
-            Path(os.getenv("ProgramFiles", "")) / "Google" / "Chrome" / "Application" / exe_name,
-            Path(os.getenv("ProgramFiles(x86)", "")) / "Google" / "Chrome" / "Application" / exe_name,
-            Path(os.getenv("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / exe_name,
-        ]
+        if sys.platform == "darwin":
+            candidates = [
+                Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                Path.home() / "Applications" / "Google Chrome.app" / "Contents" / "MacOS" / "Google Chrome",
+                Path("/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"),
+            ]
+            executable_names = ["google-chrome", "chrome", "chromium", "chromium-browser"]
+        elif os.name == "nt":
+            executable_names = ["chrome.exe"]
+            candidates = [
+                Path(os.getenv("ProgramFiles", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                Path(os.getenv("ProgramFiles(x86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                Path(os.getenv("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+            ]
+        else:
+            executable_names = ["google-chrome", "google-chrome-stable", "chrome", "chromium", "chromium-browser"]
     else:
-        exe_name = "msedge.exe"
-        candidates = [
-            Path(os.getenv("ProgramFiles(x86)", "")) / "Microsoft" / "Edge" / "Application" / exe_name,
-            Path(os.getenv("ProgramFiles", "")) / "Microsoft" / "Edge" / "Application" / exe_name,
-            Path(os.getenv("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "Application" / exe_name,
-        ]
+        if sys.platform == "darwin":
+            candidates = [
+                Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                Path.home() / "Applications" / "Microsoft Edge.app" / "Contents" / "MacOS" / "Microsoft Edge",
+            ]
+            executable_names = ["microsoft-edge", "microsoft-edge-stable", "msedge"]
+        elif os.name == "nt":
+            executable_names = ["msedge.exe"]
+            candidates = [
+                Path(os.getenv("ProgramFiles(x86)", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+                Path(os.getenv("ProgramFiles", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+                Path(os.getenv("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+            ]
+        else:
+            executable_names = ["microsoft-edge", "microsoft-edge-stable", "msedge"]
 
     for candidate in candidates:
         if candidate.exists():
             return candidate
 
-    for directory in os.getenv("PATH", "").split(os.pathsep):
-        candidate = Path(directory) / exe_name
-        if candidate.exists():
-            return candidate
+    for executable_name in executable_names:
+        path = shutil.which(executable_name)
+        if path:
+            return Path(path)
 
-    raise RuntimeError(f"{exe_name} not found.")
+    raise RuntimeError(f"{browser} executable not found.")
 
 
 def _free_local_port() -> int:
@@ -892,6 +915,17 @@ def _wait_for_cdp(port: int, timeout_seconds: int = 30) -> None:
 
 
 def _stop_dedicated_chrome_profile(user_data_dir: Path) -> None:
+    if sys.platform == "darwin":
+        with suppress(Exception):
+            subprocess.run(
+                ["pkill", "-f", str(user_data_dir)],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+        return
+
     if os.name != "nt":
         return
     escaped = str(user_data_dir).replace("'", "''")
@@ -3052,6 +3086,7 @@ def _upstream_retry_count() -> int:
 
 
 def _adapter_console_html() -> str:
+    start_entry = "START_HERE.command" if sys.platform == "darwin" else "START_HERE.bat"
     body = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -3417,7 +3452,7 @@ def _adapter_console_html() -> str:
   <header>
     <div>
       <h1>Gemini OpenAI 适配器控制台</h1>
-      <p class="muted">以后只记一个入口：双击 <code>START_HERE.bat</code>。它会启动服务并打开这个控制台。</p>
+      <p class="muted">以后只记一个入口：双击 <code>__START_ENTRY__</code>。它会启动服务并打开这个控制台。</p>
     </div>
     <div class="top-actions">
       <a class="btn secondary" href="/guide.html" target="_blank" rel="noreferrer">入门引导</a>
@@ -3443,7 +3478,7 @@ def _adapter_console_html() -> str:
     <div class="split">
       <div>
         <h2>入门引导</h2>
-        <p class="muted">日常只双击根目录的 <code>START_HERE.bat</code>。第一次使用时，先确认浏览器里的 Gemini 能正常发消息，再刷新登录凭据，然后运行快速测试。</p>
+        <p class="muted">日常只双击根目录的 <code>__START_ENTRY__</code>。第一次使用时，先确认浏览器里的 Gemini 能正常发消息，再刷新登录凭据，然后运行快速测试。</p>
         <div class="guide-actions">
           <a class="btn" href="/guide.html" target="_blank" rel="noreferrer">打开完整入门说明</a>
           <a class="btn secondary" href="#config">查看 Cline 配置</a>
@@ -3452,7 +3487,7 @@ def _adapter_console_html() -> str:
         </div>
       </div>
       <table class="quick-table">
-        <tr><th>第一步</th><td>双击 <code>START_HERE.bat</code></td></tr>
+        <tr><th>第一步</th><td>双击 <code>__START_ENTRY__</code></td></tr>
         <tr><th>控制台</th><td><code>http://127.0.0.1:8000/</code></td></tr>
         <tr><th>Cline 地址</th><td><code>http://127.0.0.1:8000/v1</code></td></tr>
         <tr><th>模型</th><td><code>gemini-3-flash</code> 或 <code>gemini-3-pro</code></td></tr>
@@ -4152,7 +4187,10 @@ setInterval(refreshAll, 30000);
 </script>
 </body>
 </html>"""
-    return body.replace("__PRICING_SOURCE_URL__", html.escape(PRICING_SOURCE_URL, quote=True))
+    return (
+        body.replace("__PRICING_SOURCE_URL__", html.escape(PRICING_SOURCE_URL, quote=True))
+        .replace("__START_ENTRY__", html.escape(start_entry, quote=True))
+    )
 
 
 @app.get("/", response_class=HTMLResponse)

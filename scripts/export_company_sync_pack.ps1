@@ -18,6 +18,7 @@ $files = @(
     "pyproject.toml",
     "openai_adapter_server.py",
     "START_HERE.bat",
+    "START_HERE.command",
     ".clinerules",
     ".clineignore",
     ".gitattributes",
