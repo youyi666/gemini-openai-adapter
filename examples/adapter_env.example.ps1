@@ -6,6 +6,9 @@ $env:OPENAI_ADAPTER_LOG_LEVEL = "INFO"
 $env:OPENAI_ADAPTER_CORS_ORIGINS = "*"
 $env:GEMINI_WEBAPI_LOG_LEVEL = "WARNING"
 $env:GEMINI_REQUEST_TIMEOUT = "300"
+# Optional. Leave empty for auto-detection: project proxy 17997 first,
+# then the traditional local proxy 7897 if it is listening.
+# $env:GEMINI_PROXY = "http://127.0.0.1:17997"
 $env:GEMINI_DEFAULT_MODEL = "gemini-3-pro"
 $env:OPENAI_ADAPTER_PROMPT_MODE = "auto"
 $env:OPENAI_ADAPTER_MAX_PROMPT_TOKENS = "48000"
