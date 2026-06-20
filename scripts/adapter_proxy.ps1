@@ -134,7 +134,11 @@ function Set-AdapterProxyDefaults {
             Write-Host ("[Gemini Adapter] GEMINI_PROXY already set: {0}" -f (Format-AdapterProxyForLog $env:GEMINI_PROXY))
             return
         }
-        Write-Host ("[Gemini Adapter] GEMINI_PROXY is set but unavailable: {0}" -f (Format-AdapterProxyForLog $env:GEMINI_PROXY))
+        $message = "[Gemini Adapter] GEMINI_PROXY is set but unavailable: {0}" -f (Format-AdapterProxyForLog $env:GEMINI_PROXY)
+        if ($env:OPENAI_ADAPTER_STRICT_GEMINI_PROXY -match "^(1|true|yes|on)$") {
+            throw $message
+        }
+        Write-Host $message
     }
 
     $candidates = @(

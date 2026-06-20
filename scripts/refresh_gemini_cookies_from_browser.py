@@ -119,6 +119,24 @@ def _score(values: dict[str, str]) -> int:
     return sum(1 for name in COOKIE_NAMES if values.get(name))
 
 
+def _requires_cookie_change() -> bool:
+    return os.getenv("OPENAI_ADAPTER_COOKIE_REQUIRE_CHANGE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _changed_from_previous(values: dict[str, str], previous: dict[str, str]) -> bool:
+    if not previous:
+        return True
+    return any(
+        values.get(name) and values.get(name) != previous.get(name)
+        for name in COOKIE_NAMES
+    )
+
+
 def _read_direct_cookie_db(
     browser_filter: str,
     profile: str,
@@ -201,6 +219,13 @@ def refresh_cookies_from_browser(output_path: Path | str) -> dict[str, object]:
 
     merged = dict(existing)
     merged.update(values)
+    if _requires_cookie_change() and not _changed_from_previous(values, existing):
+        raise RuntimeError(
+            "Readable browser profiles only returned the same Gemini auth cookies "
+            "that are already unauthenticated. Sign in again in the browser or use "
+            "the CDP login flow."
+        )
+
     payload = {
         "updated_at": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
         "source": f"{browser}:{domain}",
