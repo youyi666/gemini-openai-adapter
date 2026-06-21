@@ -2337,7 +2337,8 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _max_prompt_tokens() -> int:
-    return max(0, _env_int("OPENAI_ADAPTER_MAX_PROMPT_TOKENS", 48_000))
+    # 彻底调大到 120,000，防止因历史上下文积累导致的任何溢出报错
+    return max(0, _env_int("OPENAI_ADAPTER_MAX_PROMPT_TOKENS", 120_000))
 
 
 def _ensure_prompt_budget(prompt: str) -> int:
