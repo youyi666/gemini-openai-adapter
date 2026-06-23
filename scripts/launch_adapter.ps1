@@ -93,6 +93,8 @@ if (-not (Test-AdapterDependencies)) {
 }
 
 . .\adapter_env.local.ps1
+. (Join-Path $ScriptDir "adapter_proxy.ps1")
+Set-AdapterProxyDefaults
 
 $port = 8000
 if ($env:OPENAI_ADAPTER_PORT -and ($env:OPENAI_ADAPTER_PORT -as [int])) {
@@ -117,19 +119,29 @@ else {
     else {
         Write-LauncherLine "Starting server in background..."
         $runner = Join-Path $ScriptDir "run_server.ps1"
-        Start-Process -FilePath powershell.exe `
+        $serverProcess = Start-Process -FilePath powershell.exe `
             -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner) `
             -WindowStyle Hidden `
-            -WorkingDirectory $Root
+            -WorkingDirectory $Root `
+            -PassThru
 
         $deadline = (Get-Date).AddSeconds(75)
         do {
             Start-Sleep -Seconds 2
             $health = Get-AdapterHealth -Port $port
+            if (-not $health) {
+                $serverProcess.Refresh()
+                if ($serverProcess.HasExited) {
+                    break
+                }
+            }
         } while (-not $health -and (Get-Date) -lt $deadline)
 
         if ($health) {
             Write-LauncherLine "Server started."
+        }
+        elseif ($serverProcess.HasExited) {
+            Write-LauncherLine ("Server process exited early with code {0}. Check runtime\server.log." -f $serverProcess.ExitCode)
         }
         else {
             Write-LauncherLine "Server is still starting or failed. Check Terminal Output in the panel."

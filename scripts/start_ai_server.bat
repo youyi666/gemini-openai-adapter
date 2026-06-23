@@ -8,5 +8,5 @@ if not exist "adapter_env.local.ps1" (
   pause
   exit /b 1
 )
-powershell -NoProfile -ExecutionPolicy Bypass -Command ". .\adapter_env.local.ps1; python .\openai_adapter_server.py"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ". .\adapter_env.local.ps1; . .\scripts\adapter_proxy.ps1; Set-AdapterProxyDefaults; python .\openai_adapter_server.py"
 pause

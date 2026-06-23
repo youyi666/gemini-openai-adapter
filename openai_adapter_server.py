@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     from fastapi import FastAPI, Request
@@ -294,6 +295,85 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid %s=%r; falling back to %s", name, raw, default)
         return default
+
+
+def _normalize_proxy_url(value: str | None) -> str | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if "://" not in text:
+        text = f"http://{text}"
+    return text
+
+
+def _proxy_for_log(proxy: str | None) -> str:
+    if not proxy:
+        return "direct"
+    try:
+        parts = urlsplit(proxy)
+        if parts.username or parts.password:
+            host = parts.hostname or ""
+            if parts.port:
+                host = f"{host}:{parts.port}"
+            return urlunsplit((parts.scheme, f"***:***@{host}", parts.path, parts.query, parts.fragment))
+    except ValueError:
+        return "<invalid>"
+    return proxy
+
+
+def _split_proxy_candidates(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    candidates: list[str] = []
+    for item in re.split(r"[\r\n,]+", raw):
+        normalized = _normalize_proxy_url(item)
+        if normalized:
+            candidates.append(normalized)
+    return candidates
+
+
+def _gemini_proxy_candidates() -> list[str | None]:
+    candidates: list[str | None] = []
+    explicit_proxy = _normalize_proxy_url(os.getenv("GEMINI_PROXY"))
+    configured_candidates = _split_proxy_candidates(
+        os.getenv("OPENAI_ADAPTER_GEMINI_PROXY_CANDIDATES")
+        or os.getenv("OPENAI_ADAPTER_PROXY_CANDIDATES")
+    )
+    if configured_candidates:
+        candidates.extend(configured_candidates)
+        if explicit_proxy:
+            candidates.append(explicit_proxy)
+    else:
+        if explicit_proxy:
+            candidates.append(explicit_proxy)
+        candidates.extend(
+            [
+                "http://127.0.0.1:17997",
+                "http://127.0.0.1:7897",
+            ]
+        )
+
+    if _env_bool("OPENAI_ADAPTER_GEMINI_DIRECT_FALLBACK", False):
+        candidates.append(None)
+
+    deduped: list[str | None] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = candidate or "<direct>"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+
+    return deduped or [None]
+
+
+def _gemini_proxy_config() -> dict[str, Any]:
+    return {
+        "selected": _proxy_for_log(os.getenv("GEMINI_PROXY")),
+        "candidates": [_proxy_for_log(candidate) for candidate in _gemini_proxy_candidates()],
+        "direct_fallback": _env_bool("OPENAI_ADAPTER_GEMINI_DIRECT_FALLBACK", False),
+    }
 
 
 def _load_cookies_json(path: str | os.PathLike[str]) -> dict[str, str]:
@@ -576,50 +656,76 @@ async def _create_gemini_client() -> GeminiClient:
     verify_ssl = _env_bool("GEMINI_VERIFY_SSL", True) and not _env_bool(
         "GEMINI_SKIP_VERIFY", False
     )
-    client = GeminiClient(
-        secure_1psid=secure_1psid,
-        secure_1psidts=secure_1psidts,
-        proxy=os.getenv("GEMINI_PROXY"),
-        verify=verify_ssl,
-    )
-    if cookie_values:
-        client.cookies = cookie_values
-
     timeout = _env_float("GEMINI_REQUEST_TIMEOUT", 300)
     auto_refresh = _env_bool("GEMINI_AUTO_REFRESH", True)
     refresh_interval = _env_float("GEMINI_REFRESH_INTERVAL", 600)
     watchdog_timeout = _env_float("GEMINI_WATCHDOG_TIMEOUT", 120)
     verbose = _env_bool("GEMINI_VERBOSE", False)
+    proxy_candidates = _gemini_proxy_candidates()
+    last_error: BaseException | None = None
 
-    logger.info(
-        "Initializing Gemini client: timeout=%s auto_refresh=%s proxy=%s verify_ssl=%s",
-        timeout,
-        auto_refresh,
-        "set" if os.getenv("GEMINI_PROXY") else "not set",
-        verify_ssl,
-    )
-    try:
-        await client.init(
-            timeout=timeout,
-            auto_close=False,
-            auto_refresh=auto_refresh,
-            refresh_interval=refresh_interval,
-            watchdog_timeout=watchdog_timeout,
-            verbose=verbose,
+    for index, proxy in enumerate(proxy_candidates, start=1):
+        client = GeminiClient(
+            secure_1psid=secure_1psid,
+            secure_1psidts=secure_1psidts,
+            proxy=proxy,
+            verify=verify_ssl,
         )
-    except AuthError:
-        logger.error(
-            "Gemini authentication failed. Refresh __Secure-1PSID / "
-            "__Secure-1PSIDTS or update GEMINI_COOKIES_JSON.",
-            exc_info=True,
-        )
-        raise
-    except Exception:
-        logger.error("Gemini client initialization failed.", exc_info=True)
-        raise
+        if cookie_values:
+            client.cookies = cookie_values
 
-    logger.info("Gemini client initialized successfully.")
-    return client
+        logger.info(
+            "Initializing Gemini client: timeout=%s auto_refresh=%s proxy=%s "
+            "candidate=%s/%s verify_ssl=%s",
+            timeout,
+            auto_refresh,
+            _proxy_for_log(proxy),
+            index,
+            len(proxy_candidates),
+            verify_ssl,
+        )
+        try:
+            await client.init(
+                timeout=timeout,
+                auto_close=False,
+                auto_refresh=auto_refresh,
+                refresh_interval=refresh_interval,
+                watchdog_timeout=watchdog_timeout,
+                verbose=verbose,
+            )
+        except AuthError:
+            logger.error(
+                "Gemini authentication failed via proxy=%s. Refresh "
+                "__Secure-1PSID / __Secure-1PSIDTS or update GEMINI_COOKIES_JSON.",
+                _proxy_for_log(proxy),
+                exc_info=True,
+            )
+            with suppress(Exception):
+                await client.close()
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Gemini client initialization failed via proxy=%s; trying next "
+                "candidate if available.",
+                _proxy_for_log(proxy),
+                exc_info=True,
+            )
+            with suppress(Exception):
+                await client.close()
+            continue
+
+        setattr(client, "_adapter_proxy", proxy)
+        logger.info(
+            "Gemini client initialized successfully via proxy=%s.",
+            _proxy_for_log(proxy),
+        )
+        return client
+
+    logger.error("Gemini client initialization failed for all proxy candidates.")
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Gemini client initialization failed for all proxy candidates.")
 
 
 @asynccontextmanager
@@ -888,14 +994,21 @@ def _cookie_refresh_report_from_file(path: Path, source_hint: str | None = None)
     }
 
 
-def _run_cookie_refresh_script(cookie_path: Path) -> dict[str, Any]:
+def _run_cookie_refresh_script(
+    cookie_path: Path,
+    require_cookie_change: bool = False,
+) -> dict[str, Any]:
     script_path = ROOT / "scripts" / "refresh_gemini_cookies_from_browser.py"
+    env = os.environ.copy()
+    if require_cookie_change:
+        env["OPENAI_ADAPTER_COOKIE_REQUIRE_CHANGE"] = "1"
     result = subprocess.run(
         [sys.executable, str(script_path), str(cookie_path)],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
         timeout=90,
+        env=env,
     )
     if result.returncode != 0:
         detail = (result.stdout + "\n" + result.stderr).strip()
@@ -1122,7 +1235,10 @@ def _run_cookie_refresh(
 ) -> dict[str, Any]:
     attempts: list[dict[str, Any]] = []
     try:
-        report = _run_cookie_refresh_script(cookie_path)
+        report = _run_cookie_refresh_script(
+            cookie_path,
+            require_cookie_change=require_cookie_change,
+        )
         report["method"] = "browser-cookie-db"
         attempts.append({"method": "browser-cookie-db", "ok": True})
         report["attempts"] = attempts
@@ -2309,7 +2425,8 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _max_prompt_tokens() -> int:
-    return max(0, _env_int("OPENAI_ADAPTER_MAX_PROMPT_TOKENS", 48_000))
+    # 彻底调大到 120,000，防止因历史上下文积累导致的任何溢出报错
+    return max(0, _env_int("OPENAI_ADAPTER_MAX_PROMPT_TOKENS", 120_000))
 
 
 def _ensure_prompt_budget(prompt: str) -> int:
@@ -4452,10 +4569,15 @@ async def health(request: Request) -> dict[str, Any]:
             "interval_seconds": _cookie_writeback_interval_seconds(),
         },
         "cookie_refresh": _cookie_refresh_config(),
+<<<<<<< HEAD
         "client_keys": {
             "required": _env_bool("OPENAI_ADAPTER_REQUIRE_CLIENT_KEY", False),
             "configured_clients": len(_client_key_labels()),
         },
+=======
+        "upstream_proxy": _proxy_for_log(getattr(client, "_adapter_proxy", None)),
+        "upstream_proxy_config": _gemini_proxy_config(),
+>>>>>>> 52aa03ae866db7a3a21994faa6c1272d01eb1589
         "prompt_budget": {
             "max_prompt_tokens": _max_prompt_tokens(),
         },

@@ -8,6 +8,10 @@ $env:OPENAI_ADAPTER_REQUIRE_CLIENT_KEY = "0"
 $env:OPENAI_ADAPTER_CLIENT_KEYS = "alice-key=张三;bob-key=李四"
 $env:GEMINI_WEBAPI_LOG_LEVEL = "WARNING"
 $env:GEMINI_REQUEST_TIMEOUT = "300"
+# Optional. Leave empty for auto-detection: project proxy 17997 first,
+# then the traditional local proxy 7897 if it is listening.
+# $env:GEMINI_PROXY = "http://127.0.0.1:17997"
+$env:OPENAI_ADAPTER_GEMINI_PROXY_CANDIDATES = "http://127.0.0.1:17997,http://127.0.0.1:7897"
 $env:GEMINI_DEFAULT_MODEL = "gemini-3-pro"
 $env:OPENAI_ADAPTER_PROMPT_MODE = "auto"
 $env:OPENAI_ADAPTER_MAX_PROMPT_TOKENS = "48000"
