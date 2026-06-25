@@ -38,6 +38,14 @@ Model ID: gemini-3-flash
 Model ID: gemini-3-pro
 ```
 
+如果维护者已经额外启用了 gpt4free sidecar，也可以把模型切到：
+
+```text
+Model ID: g4f:gpt-4o-mini
+```
+
+这条路会转发到本机另一个 g4f OpenAI 兼容服务，不依赖 Gemini Cookie。它适合作为备用/实验通道；如果不可用，先确认维护者是否已经设置 `OPENAI_ADAPTER_G4F_BASE_URL`，并且 g4f 服务本身正在运行。
+
 如果某个插件要求 Base URL 不带 `/v1`，也可以填：
 
 ```text

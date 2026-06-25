@@ -20,6 +20,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -330,6 +332,92 @@ def _split_proxy_candidates(raw: str | None) -> list[str]:
         if normalized:
             candidates.append(normalized)
     return candidates
+
+
+G4F_MODEL_PREFIXES = ("g4f:", "gpt4free:")
+DEFAULT_G4F_MODELS = (
+    "g4f:gpt-4o-mini",
+    "g4f:gpt-4.1-mini",
+    "g4f:gpt-4",
+    "g4f:deepseek-v3",
+)
+
+
+class G4FUpstreamError(RuntimeError):
+    """Raised when the optional gpt4free sidecar is unreachable or invalid."""
+
+
+def _split_csv_env(name: str, default: tuple[str, ...]) -> list[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return list(default)
+    values = [item.strip() for item in re.split(r"[\r\n,]+", raw) if item.strip()]
+    return values or list(default)
+
+
+def _g4f_base_url() -> str | None:
+    raw = os.getenv("OPENAI_ADAPTER_G4F_BASE_URL", "").strip()
+    if not raw:
+        return None
+    return raw.rstrip("/")
+
+
+def _g4f_timeout_seconds() -> float:
+    return max(5.0, _env_float("OPENAI_ADAPTER_G4F_TIMEOUT_SECONDS", 180.0))
+
+
+def _g4f_provider() -> str | None:
+    provider = os.getenv("OPENAI_ADAPTER_G4F_PROVIDER", "").strip()
+    return provider or None
+
+
+def _g4f_models() -> list[str]:
+    return _split_csv_env("OPENAI_ADAPTER_G4F_MODELS", DEFAULT_G4F_MODELS)
+
+
+def _strip_g4f_model_prefix(model: str | None) -> tuple[str, bool]:
+    text = (model or "").strip()
+    lowered = text.lower()
+    for prefix in G4F_MODEL_PREFIXES:
+        if lowered.startswith(prefix):
+            return text[len(prefix) :].strip() or "gpt-4o-mini", True
+    return text, False
+
+
+def _looks_like_g4f_model(model: str | None) -> bool:
+    text = (model or "").strip().lower()
+    if not text:
+        return False
+    return bool(
+        text.startswith(("gpt-", "o1", "o3", "o4", "deepseek", "kimi", "claude"))
+        or text in {"chatgpt", "llama-3.1", "llama-3.2", "llama-3.3"}
+    )
+
+
+def _should_route_to_g4f(model: str | None) -> bool:
+    if _g4f_base_url() is None:
+        return False
+    stripped_model, explicit = _strip_g4f_model_prefix(model)
+    if explicit:
+        return True
+    if stripped_model.startswith("gemini-") or stripped_model in KNOWN_GEMINI_MODEL_NAMES:
+        return False
+    return _env_bool("OPENAI_ADAPTER_G4F_ROUTE_OPENAI_MODELS", True) and _looks_like_g4f_model(
+        stripped_model
+    )
+
+
+def _g4f_status_info() -> dict[str, Any]:
+    base_url = _g4f_base_url()
+    return {
+        "enabled": base_url is not None,
+        "base_url": base_url,
+        "route_openai_models": _env_bool("OPENAI_ADAPTER_G4F_ROUTE_OPENAI_MODELS", True),
+        "expose_unprefixed_models": _env_bool("OPENAI_ADAPTER_G4F_EXPOSE_UNPREFIXED", True),
+        "provider": _g4f_provider(),
+        "models": _g4f_models(),
+        "timeout_seconds": _g4f_timeout_seconds(),
+    }
 
 
 def _gemini_proxy_candidates() -> list[str | None]:
@@ -2564,6 +2652,7 @@ def _record_usage(
     stream: bool,
     usage: dict[str, int],
     cost_estimate: dict[str, Any],
+    upstream_provider: str = "gemini",
 ) -> None:
     record = {
         "timestamp": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -2573,6 +2662,8 @@ def _record_usage(
         "host": socket.gethostname(),
         "requested_model": requested_model,
         "gemini_model": gemini_model,
+        "upstream_provider": upstream_provider,
+        "upstream_model": gemini_model,
         "stream": stream,
         "usage": usage,
         "cost_estimate": cost_estimate,
@@ -2869,6 +2960,241 @@ def _openai_error_response(
             }
         },
     )
+
+
+def _join_g4f_url(base_url: str, path: str) -> str:
+    clean_base = base_url.rstrip("/")
+    clean_path = path if path.startswith("/") else f"/{path}"
+    return f"{clean_base}{clean_path}"
+
+
+def _extract_openai_response_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    first = choices[0] or {}
+    message = first.get("message") or {}
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(parts)
+    text = first.get("text")
+    if isinstance(text, str):
+        return text
+    delta = first.get("delta") or {}
+    if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+        return delta["content"]
+    return ""
+
+
+def _g4f_request_payload(payload: ChatCompletionRequest) -> tuple[str, dict[str, Any]]:
+    upstream_model, _ = _strip_g4f_model_prefix(payload.model)
+    body = payload.model_dump(exclude_none=True)
+    body["model"] = upstream_model or "gpt-4o-mini"
+    body["stream"] = False
+    provider = _g4f_provider()
+    if provider and not body.get("provider"):
+        body["provider"] = provider
+    return body["model"], body
+
+
+def _post_g4f_chat_completion(
+    payload: ChatCompletionRequest,
+) -> tuple[str, dict[str, Any]]:
+    base_url = _g4f_base_url()
+    if base_url is None:
+        raise G4FUpstreamError(
+            "gpt4free upstream is not configured. Set OPENAI_ADAPTER_G4F_BASE_URL, "
+            "for example http://127.0.0.1:1337/v1."
+        )
+
+    upstream_model, body = _g4f_request_payload(payload)
+    url = _join_g4f_url(base_url, "/chat/completions")
+    request_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    api_key = os.getenv("OPENAI_ADAPTER_G4F_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    request = urllib.request.Request(
+        url,
+        data=request_body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_g4f_timeout_seconds()) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise G4FUpstreamError(
+            f"gpt4free upstream returned HTTP {exc.code}: {error_body[:800]}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise G4FUpstreamError(f"gpt4free upstream is unreachable: {exc.reason}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise G4FUpstreamError(
+            f"gpt4free upstream returned non-JSON response: {raw[:800]}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise G4FUpstreamError("gpt4free upstream returned an unexpected response shape.")
+    return upstream_model, data
+
+
+async def _call_g4f_chat_completion(
+    payload: ChatCompletionRequest,
+) -> tuple[str, dict[str, Any]]:
+    return await asyncio.to_thread(_post_g4f_chat_completion, payload)
+
+
+def _normalize_g4f_completion(
+    upstream_data: dict[str, Any],
+    *,
+    completion_id: str,
+    created: int,
+    requested_model: str,
+    upstream_model: str,
+    prompt: str,
+    stream: bool,
+) -> dict[str, Any]:
+    text = _extract_openai_response_text(upstream_data)
+    usage = upstream_data.get("usage")
+    if not isinstance(usage, dict):
+        usage, cost_estimate = _build_usage(upstream_model, prompt, text)
+    else:
+        usage = {
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        }
+        cost_estimate = _estimate_cost(upstream_model, usage["prompt_tokens"], usage["completion_tokens"])
+
+    if not usage["total_tokens"]:
+        usage, cost_estimate = _build_usage(upstream_model, prompt, text)
+
+    _record_usage(
+        completion_id,
+        requested_model,
+        upstream_model,
+        stream,
+        usage,
+        cost_estimate,
+        upstream_provider="gpt4free",
+    )
+
+    return {
+        "id": upstream_data.get("id") or completion_id,
+        "object": "chat.completion",
+        "created": int(upstream_data.get("created") or created),
+        "model": requested_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": usage,
+        "cost_estimate": cost_estimate,
+        "upstream_provider": "gpt4free",
+        "upstream_model": upstream_model,
+    }
+
+
+async def _g4f_sse_events(
+    completion: dict[str, Any],
+    completion_id: str,
+    requested_model: str,
+    created: int,
+) -> AsyncGenerator[dict[str, str], None]:
+    text = _extract_openai_response_text(completion)
+    yield {
+        "data": _json_dumps(
+            _stream_chunk_payload(
+                completion_id,
+                requested_model,
+                created,
+                {"role": "assistant"},
+            )
+        )
+    }
+    if text:
+        yield {
+            "data": _json_dumps(
+                _stream_chunk_payload(
+                    completion_id,
+                    requested_model,
+                    created,
+                    {"content": text},
+                )
+            )
+        }
+    finish_payload = _stream_chunk_payload(
+        completion_id,
+        requested_model,
+        created,
+        {},
+        finish_reason="stop",
+    )
+    if "usage" in completion:
+        finish_payload["usage"] = completion["usage"]
+    if "cost_estimate" in completion:
+        finish_payload["cost_estimate"] = completion["cost_estimate"]
+    yield {"data": _json_dumps(finish_payload)}
+    yield {"data": "[DONE]"}
+
+
+async def _handle_g4f_chat_completion(
+    payload: ChatCompletionRequest,
+    completion_id: str,
+    created: int,
+) -> JSONResponse | EventSourceResponse:
+    prompt = _messages_to_prompt(payload.messages, include_local_context=False)
+    upstream_model, upstream_data = await _call_g4f_chat_completion(payload)
+    completion = _normalize_g4f_completion(
+        upstream_data,
+        completion_id=completion_id,
+        created=created,
+        requested_model=payload.model,
+        upstream_model=upstream_model,
+        prompt=prompt,
+        stream=payload.stream,
+    )
+    logger.info(
+        "Completed gpt4free response: id=%s requested_model=%s upstream_model=%s "
+        "stream=%s response_chars=%s",
+        completion_id,
+        payload.model,
+        upstream_model,
+        payload.stream,
+        len(_extract_openai_response_text(completion)),
+    )
+    if payload.stream:
+        return EventSourceResponse(
+            _g4f_sse_events(completion, completion_id, payload.model, created),
+            media_type="text/event-stream",
+            ping=_stream_ping_seconds(),
+        )
+    return JSONResponse(completion)
 
 
 def _stream_chunk_payload(
@@ -4436,6 +4762,7 @@ async def health(request: Request) -> dict[str, Any]:
         "cookie_refresh": _cookie_refresh_config(),
         "upstream_proxy": _proxy_for_log(getattr(client, "_adapter_proxy", None)),
         "upstream_proxy_config": _gemini_proxy_config(),
+        "gpt4free": _g4f_status_info(),
         "prompt_budget": {
             "max_prompt_tokens": _max_prompt_tokens(),
         },
@@ -4760,6 +5087,32 @@ async def list_models(request: Request) -> dict[str, Any]:
             }
             for model in Model
         ]
+
+    if _g4f_base_url() is not None:
+        g4f_model_ids: list[str] = []
+        for model_id in _g4f_models():
+            if model_id not in g4f_model_ids:
+                g4f_model_ids.append(model_id)
+            stripped_model, explicit = _strip_g4f_model_prefix(model_id)
+            if (
+                explicit
+                and _env_bool("OPENAI_ADAPTER_G4F_EXPOSE_UNPREFIXED", True)
+                and stripped_model not in g4f_model_ids
+            ):
+                g4f_model_ids.append(stripped_model)
+
+        existing_ids = {item["id"] for item in data}
+        for model_id in g4f_model_ids:
+            if model_id in existing_ids:
+                continue
+            data.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "gpt4free",
+                }
+            )
 
     return {"object": "list", "data": data}
 
@@ -5166,6 +5519,15 @@ async def chat_completions(
     created = int(time.time())
 
     try:
+        if _should_route_to_g4f(payload.model):
+            logger.info(
+                "Routing chat completion to gpt4free: id=%s model=%s stream=%s",
+                completion_id,
+                payload.model,
+                payload.stream,
+            )
+            return await _handle_g4f_chat_completion(payload, completion_id, created)
+
         client = _get_client(request)
         _ensure_client_authenticated(client)
         prompt, prompt_tokens = _build_prompt_with_budget(payload.messages)
@@ -5281,6 +5643,14 @@ async def chat_completions(
             str(exc),
             error_type="invalid_request_error",
             code="invalid_request",
+        )
+    except G4FUpstreamError as exc:
+        logger.error("gpt4free upstream error.", exc_info=True)
+        return _openai_error_response(
+            502,
+            f"gpt4free upstream error: {exc}",
+            error_type="upstream_error",
+            code="gpt4free_upstream_error",
         )
     except AuthError as exc:
         logger.error("Gemini Cookie/authentication failure.", exc_info=True)

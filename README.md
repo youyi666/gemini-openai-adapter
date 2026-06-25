@@ -28,6 +28,49 @@ OpenAI 兼容地址：
 http://127.0.0.1:8000/v1
 ```
 
+## 可选：接入 gpt4free 逆向 GPT 通道
+
+本项目可以把 [xtekky/gpt4free](https://github.com/xtekky/gpt4free) 作为外部 sidecar 上游使用，不把 g4f 源码复制进本仓库。
+
+先单独启动 g4f 的 OpenAI 兼容 API，例如：
+
+```powershell
+python -m g4f --port 1337 --debug
+```
+
+或使用 g4f Docker slim 示例，把 Interference API 暴露到 `http://127.0.0.1:1337/v1`。
+
+然后在启动本项目 adapter 前设置：
+
+```powershell
+$env:OPENAI_ADAPTER_G4F_BASE_URL = "http://127.0.0.1:1337/v1"
+```
+
+启用后，以下模型会走 gpt4free 通道，不再走 Gemini：
+
+```text
+g4f:gpt-4o-mini
+g4f:gpt-4.1-mini
+g4f:gpt-4
+g4f:deepseek-v3
+```
+
+也可以直接请求常见 GPT 模型名，例如 `gpt-4o-mini`。如需只允许显式 `g4f:` 前缀，可设置：
+
+```powershell
+$env:OPENAI_ADAPTER_G4F_ROUTE_OPENAI_MODELS = "0"
+```
+
+可选参数：
+
+```powershell
+$env:OPENAI_ADAPTER_G4F_PROVIDER = "PollinationsAI"
+$env:OPENAI_ADAPTER_G4F_TIMEOUT_SECONDS = "180"
+$env:OPENAI_ADAPTER_G4F_MODELS = "g4f:gpt-4o-mini,g4f:deepseek-v3"
+```
+
+说明：gpt4free 的 provider 可用性、质量和合规风险取决于它自己的上游。这里把它作为备用/实验通道，而不是稳定生产通道。
+
 ## 启动代理
 
 Windows 启动脚本会在启动 Gemini 上游客户端前自动选择代理：
