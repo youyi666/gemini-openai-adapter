@@ -4,6 +4,8 @@ $env:OPENAI_ADAPTER_HOST = "127.0.0.1"
 $env:OPENAI_ADAPTER_PORT = "8000"
 $env:OPENAI_ADAPTER_LOG_LEVEL = "INFO"
 $env:OPENAI_ADAPTER_CORS_ORIGINS = "*"
+$env:OPENAI_ADAPTER_REQUIRE_CLIENT_KEY = "0"
+$env:OPENAI_ADAPTER_CLIENT_KEYS = "alice-key=张三;bob-key=李四"
 $env:GEMINI_WEBAPI_LOG_LEVEL = "WARNING"
 $env:GEMINI_REQUEST_TIMEOUT = "300"
 # Optional. Leave empty for auto-detection: project proxy 17997 first,
