@@ -862,94 +862,6 @@ def _get_client(request: Request) -> GeminiClient:
     return client
 
 
-def _extract_client_api_key(request: Request) -> str:
-    authorization = request.headers.get("authorization", "").strip()
-    if authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    return (
-        request.headers.get("x-api-key", "").strip()
-        or request.headers.get("api-key", "").strip()
-        or request.headers.get("openai-api-key", "").strip()
-    )
-
-
-def _client_key_labels() -> dict[str, str]:
-    raw = os.getenv("OPENAI_ADAPTER_CLIENT_KEYS", "").strip()
-    if not raw:
-        return {}
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        parsed = None
-
-    if isinstance(parsed, dict):
-        return {
-            str(key).strip(): str(value).strip()
-            for key, value in parsed.items()
-            if str(key).strip()
-        }
-
-    labels: dict[str, str] = {}
-    for part in re.split(r"[\n;,]+", raw):
-        item = part.strip()
-        if not item:
-            continue
-        if "=" in item:
-            key, label = item.split("=", 1)
-        elif ":" in item:
-            key, label = item.split(":", 1)
-        else:
-            key, label = item, item
-        key = key.strip()
-        label = label.strip()
-        if key:
-            labels[key] = label or key
-    return labels
-
-
-def _allowed_client_keys() -> set[str]:
-    keys = set(_client_key_labels())
-    single_key = os.getenv("OPENAI_ADAPTER_API_KEY", "").strip()
-    if single_key:
-        keys.add(single_key)
-    return keys
-
-
-def _enforce_client_key_if_configured(request: Request) -> None:
-    if not _env_bool("OPENAI_ADAPTER_REQUIRE_CLIENT_KEY", False):
-        return
-    key = _extract_client_api_key(request)
-    allowed = _allowed_client_keys()
-    if not key or (allowed and key not in allowed):
-        raise PermissionError("OpenAI adapter API key is required or invalid.")
-
-
-def _request_client_info(request: Request) -> dict[str, Any]:
-    forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
-    remote_ip = forwarded_for or (request.client.host if request.client else "") or "unknown"
-    key = _extract_client_api_key(request)
-    labels = _client_key_labels()
-    key_label = labels.get(key, "")
-    header_name = (
-        request.headers.get("x-client-name", "").strip()
-        or request.headers.get("x-computer-name", "").strip()
-        or request.headers.get("x-machine-name", "").strip()
-    )
-    display_name = header_name or key_label or remote_ip
-    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12] if key else ""
-    client_id_source = key_hash or remote_ip
-    client_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", client_id_source).strip(".-") or "unknown"
-    return {
-        "id": client_id,
-        "display_name": display_name,
-        "ip": remote_ip,
-        "api_key_label": key_label,
-        "api_key_hash": key_hash,
-        "user_agent": request.headers.get("user-agent", "")[:240],
-    }
-
-
 def _account_status_info(client: GeminiClient) -> dict[str, Any]:
     status = getattr(client, "account_status", None)
     name = getattr(status, "name", str(status) if status is not None else "UNKNOWN")
@@ -2740,6 +2652,7 @@ def _record_usage(
     stream: bool,
     usage: dict[str, int],
     cost_estimate: dict[str, Any],
+    upstream_provider: str = "gemini",
 ) -> None:
     record = {
         "timestamp": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -2755,20 +2668,16 @@ def _record_usage(
         "usage": usage,
         "cost_estimate": cost_estimate,
     }
-    if client_info:
-        record["client"] = client_info
     _append_usage_record(record)
     logger.info(
         "Usage estimate: id=%s model=%s prompt_tokens=%s completion_tokens=%s "
-        "cost_usd=%s cost_cny=%s client=%s client_ip=%s",
+        "cost_usd=%s cost_cny=%s",
         completion_id,
         requested_model,
         usage["prompt_tokens"],
         usage["completion_tokens"],
         cost_estimate.get("total_cost_usd"),
         cost_estimate.get("total_cost_cny"),
-        (client_info or {}).get("display_name"),
-        (client_info or {}).get("ip"),
     )
 
 
@@ -2793,31 +2702,6 @@ def _record_instance_label(record: dict[str, Any]) -> str:
     if host and (not instance_id or instance_id == "unknown" or instance_id.startswith("pc-")):
         return host
     return instance_id or host or "unknown"
-
-
-def _record_client_id(record: dict[str, Any]) -> str:
-    client = record.get("client")
-    if isinstance(client, dict):
-        client_id = str(client.get("id") or "").strip()
-        if client_id:
-            return client_id
-        key_hash = str(client.get("api_key_hash") or "").strip()
-        if key_hash:
-            return key_hash
-        ip = str(client.get("ip") or "").strip()
-        if ip:
-            return ip
-    return _record_instance_id(record)
-
-
-def _record_client_label(record: dict[str, Any]) -> str:
-    client = record.get("client")
-    if isinstance(client, dict):
-        for field in ("display_name", "api_key_label", "ip", "id"):
-            value = str(client.get(field) or "").strip()
-            if value:
-                return value
-    return _record_instance_label(record)
 
 
 def _record_looks_local(record: dict[str, Any], source_path: Path) -> bool:
@@ -3374,7 +3258,6 @@ async def _openai_sse_events(
     gemini_model: str,
     prompt: str,
     created: int,
-    client_info: dict[str, Any] | None = None,
 ) -> AsyncGenerator[dict[str, str], None]:
     chunk_count = 0
     completion_parts: list[str] = []
@@ -3434,7 +3317,6 @@ async def _openai_sse_events(
             True,
             usage,
             cost_estimate,
-            client_info,
         )
         await _write_client_cookies_back(client, "stream-response")
         finish_payload = _stream_chunk_payload(
@@ -3520,7 +3402,6 @@ async def _openai_sse_events(
                         True,
                         usage,
                         cost_estimate,
-                        client_info,
                     )
                     await _write_client_cookies_back(
                         client,
@@ -4114,11 +3995,8 @@ def _adapter_console_html() -> str:
     <h3>按电脑统计</h3>
     <div class="table-wrap"><table class="data"><thead><tr><th>电脑</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>总 Token</th><th>美元</th><th>人民币</th></tr></thead><tbody id="instanceRows"></tbody></table></div>
 
-    <h3>按调用方统计</h3>
-    <div class="table-wrap"><table class="data"><thead><tr><th>调用方</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>总 Token</th><th>美元</th><th>人民币</th></tr></thead><tbody id="clientRows"></tbody></table></div>
-
     <h3>最近请求</h3>
-    <div class="table-wrap"><table class="data"><thead><tr><th>时间</th><th>调用方</th><th>请求模型</th><th>实际模型</th><th>流式</th><th>Tokens</th><th>人民币</th></tr></thead><tbody id="recentRows"></tbody></table></div>
+    <div class="table-wrap"><table class="data"><thead><tr><th>时间</th><th>电脑</th><th>请求模型</th><th>实际模型</th><th>流式</th><th>Tokens</th><th>人民币</th></tr></thead><tbody id="recentRows"></tbody></table></div>
 
     <h3>数据来源</h3>
     <div class="table-wrap"><table class="data"><thead><tr><th>文件</th><th>存在</th><th>有效记录</th><th>无效行</th></tr></thead><tbody id="sourceRows"></tbody></table></div>
@@ -4385,11 +4263,6 @@ function summaryRow(name, values) {
   </tr>`;
 }
 
-function recordClientLabel(record) {
-  const client = record?.client || {};
-  return client.display_name || client.api_key_label || client.ip || record.instance_name || record.host || record.instance_id || "未知";
-}
-
 function renderHeatmap(daily) {
   const cells = daily?.cells || [];
   const weekCount = Math.max(1, Math.ceil(cells.length / 7));
@@ -4431,7 +4304,6 @@ async function loadUsage() {
     metric("估算美元", money(totals.cost_usd, "$")),
     metric("估算人民币", money(totals.cost_cny, "¥")),
     metric("电脑数量", fmt.format(Object.keys(data.by_instance || {}).length)),
-    metric("调用方数量", fmt.format(Object.keys(data.by_client || {}).length)),
     metricHtml("共享目录", `<code>${escapeHtml(data.shared_usage_dir || "未启用")}</code>`, "small"),
   ].join("");
   renderHeatmap(data.daily || {});
@@ -4446,17 +4318,12 @@ async function loadUsage() {
     Object.entries(data.by_instance || {}).map(([name, values]) => summaryRow(name, values)),
     "暂无电脑用量记录。"
   );
-  renderRows(
-    "clientRows",
-    Object.entries(data.by_client || {}).map(([name, values]) => summaryRow(name, values)),
-    "暂无调用方用量记录。"
-  );
   $("recentRows").innerHTML = (data.recent || []).slice().reverse().map((record) => {
     const usage = record.usage || {};
     const cost = record.cost_estimate || {};
     return `<tr>
       <td title="${escapeHtml(record.timestamp || "")}">${escapeHtml(localDateTime(record.timestamp))}</td>
-      <td>${escapeHtml(recordClientLabel(record))}</td>
+      <td>${escapeHtml(record.instance_name || record.host || record.instance_id || "未知")}</td>
       <td>${escapeHtml(record.requested_model || "")}</td>
       <td>${escapeHtml(record.gemini_model || "")}</td>
       <td>${record.stream ? "是" : "否"}</td>
@@ -4893,14 +4760,9 @@ async def health(request: Request) -> dict[str, Any]:
             "interval_seconds": _cookie_writeback_interval_seconds(),
         },
         "cookie_refresh": _cookie_refresh_config(),
-<<<<<<< HEAD
-        "client_keys": {
-            "required": _env_bool("OPENAI_ADAPTER_REQUIRE_CLIENT_KEY", False),
-            "configured_clients": len(_client_key_labels()),
-        },
-=======
         "upstream_proxy": _proxy_for_log(getattr(client, "_adapter_proxy", None)),
         "upstream_proxy_config": _gemini_proxy_config(),
+        "gpt4free": _g4f_status_info(),
         "prompt_budget": {
             "max_prompt_tokens": _max_prompt_tokens(),
         },
@@ -5196,21 +5058,11 @@ loadHealth().catch(error => {{
     return HTMLResponse(body)
 
 
-@app.get("/models", response_model=None)
-@app.get("/v1/models", response_model=None)
-async def list_models(request: Request) -> dict[str, Any] | JSONResponse:
-    try:
-        _enforce_client_key_if_configured(request)
-        client = _get_client(request)
-        models = client.list_models() or []
-    except PermissionError as exc:
-        return _openai_error_response(
-            401,
-            str(exc),
-            error_type="authentication_error",
-            code="invalid_api_key",
-        )
-
+@app.get("/models")
+@app.get("/v1/models")
+async def list_models(request: Request) -> dict[str, Any]:
+    client = _get_client(request)
+    models = client.list_models() or []
     data = []
     for model in models:
         model_id = getattr(model, "model_name", "") or getattr(model, "model_id", "")
@@ -5281,7 +5133,6 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
     }
     by_model: dict[str, dict[str, Any]] = {}
     by_instance: dict[str, dict[str, Any]] = {}
-    by_client: dict[str, dict[str, Any]] = {}
 
     for record in records:
         usage = record.get("usage") or {}
@@ -5289,8 +5140,6 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
         model = record.get("requested_model") or "unknown"
         instance_id = _record_instance_id(record)
         instance_label = _record_instance_label(record)
-        client_id = _record_client_id(record)
-        client_label = _record_client_label(record)
         model_totals = by_model.setdefault(
             model,
             {
@@ -5307,19 +5156,6 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
             {
                 "instance_id": instance_id,
                 "display_name": instance_label,
-                "requests": 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "cost_usd": 0.0,
-                "cost_cny": 0.0,
-            },
-        )
-        client_totals = by_client.setdefault(
-            client_label,
-            {
-                "client_id": client_id,
-                "display_name": client_label,
                 "requests": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
@@ -5354,13 +5190,6 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
         instance_totals["cost_usd"] += cost_usd
         instance_totals["cost_cny"] += cost_cny
 
-        client_totals["requests"] += 1
-        client_totals["prompt_tokens"] += prompt_tokens
-        client_totals["completion_tokens"] += completion_tokens
-        client_totals["total_tokens"] += total_tokens
-        client_totals["cost_usd"] += cost_usd
-        client_totals["cost_cny"] += cost_cny
-
     totals["cost_usd"] = round(float(totals["cost_usd"]), 8)
     totals["cost_cny"] = round(float(totals["cost_cny"]), 8)
     for model_totals in by_model.values():
@@ -5369,9 +5198,6 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
     for instance_totals in by_instance.values():
         instance_totals["cost_usd"] = round(float(instance_totals["cost_usd"]), 8)
         instance_totals["cost_cny"] = round(float(instance_totals["cost_cny"]), 8)
-    for client_totals in by_client.values():
-        client_totals["cost_usd"] = round(float(client_totals["cost_usd"]), 8)
-        client_totals["cost_cny"] = round(float(client_totals["cost_cny"]), 8)
 
     return {
         "estimated": True,
@@ -5387,7 +5213,6 @@ async def usage_summary(limit: int = 20) -> dict[str, Any]:
         "totals": totals,
         "by_model": by_model,
         "by_instance": by_instance,
-        "by_client": by_client,
         "daily": _build_daily_usage(records),
         "recent": records[-max(0, limit) :],
     }
@@ -5694,6 +5519,15 @@ async def chat_completions(
     created = int(time.time())
 
     try:
+        if _should_route_to_g4f(payload.model):
+            logger.info(
+                "Routing chat completion to gpt4free: id=%s model=%s stream=%s",
+                completion_id,
+                payload.model,
+                payload.stream,
+            )
+            return await _handle_g4f_chat_completion(payload, completion_id, created)
+
         client = _get_client(request)
         _ensure_client_authenticated(client)
         prompt, prompt_tokens = _build_prompt_with_budget(payload.messages)
@@ -5703,7 +5537,7 @@ async def chat_completions(
         logger.info(
             "Received chat completion: id=%s model=%s gemini_model=%s "
             "stream=%s messages=%s prompt_chars=%s prompt_tokens=%s "
-            "max_prompt_tokens=%s client=%s client_ip=%s",
+            "max_prompt_tokens=%s",
             completion_id,
             payload.model,
             gemini_model,
@@ -5712,8 +5546,6 @@ async def chat_completions(
             len(prompt),
             prompt_tokens,
             _max_prompt_tokens(),
-            client_info.get("display_name"),
-            client_info.get("ip"),
         )
 
         if payload.temperature is not None:
@@ -5755,7 +5587,6 @@ async def chat_completions(
                     gemini_model,
                     prompt,
                     created,
-                    client_info,
                 ),
                 media_type="text/event-stream",
                 ping=_stream_ping_seconds(),
@@ -5776,7 +5607,6 @@ async def chat_completions(
             False,
             usage,
             cost_estimate,
-            client_info,
         )
         await _write_client_cookies_back(client, "non-stream-response")
 
@@ -5806,14 +5636,6 @@ async def chat_completions(
             }
         )
 
-    except PermissionError as exc:
-        logger.error("Rejected OpenAI-compatible request: %s", exc)
-        return _openai_error_response(
-            401,
-            str(exc),
-            error_type="authentication_error",
-            code="invalid_api_key",
-        )
     except ValueError as exc:
         logger.error("Invalid OpenAI-compatible request: %s", exc)
         return _openai_error_response(

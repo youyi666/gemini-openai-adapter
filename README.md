@@ -129,28 +129,6 @@ chmod +x ./START_HERE.command ./scripts/*.sh
 - [多电脑同步说明](docs/COMPANY_SYNC_README.md)
 - [Codex 类能力测试清单](docs/CODEX_LIKE_TESTS.md)
 
-## 局域网同事用量统计
-
-如果要让多位同事共用同一台 adapter 服务，建议给每位同事分配一个不同的本地 API Key。它不是 Google Key，只用于 adapter 识别调用方和可选访问控制。
-
-在服务端 `adapter_env.local.ps1` 里配置：
-
-```powershell
-$env:OPENAI_ADAPTER_HOST = "0.0.0.0"
-$env:OPENAI_ADAPTER_REQUIRE_CLIENT_KEY = "1"
-$env:OPENAI_ADAPTER_CLIENT_KEYS = "alice-key=张三;bob-key=李四;wang-key=王五"
-```
-
-同事 Cline 配置：
-
-```text
-Base URL: http://服务端电脑IP:8000/v1
-API Key: 分配给他的 key，例如 alice-key
-Model: gemini-3-flash 或 gemini-3-pro
-```
-
-控制台的“用量统计”会显示“按调用方统计”。如果没有配置 `OPENAI_ADAPTER_CLIENT_KEYS`，系统会退回按调用方 IP 统计。
-
 ## 不要提交
 
 以下文件包含本机状态或敏感信息，默认已被 `.gitignore` 忽略：
