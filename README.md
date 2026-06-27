@@ -124,6 +124,7 @@ chmod +x ./START_HERE.command ./scripts/*.sh
 ## 详细文档
 
 - [同事快速上手](docs/TEAM_QUICK_START.md)
+- [开发交接说明](docs/DEVELOPMENT_HANDOFF.md)
 - [macOS 快速上手](docs/MACOS_QUICK_START.md)
 - [公司电脑部署说明](docs/公司电脑部署使用说明.md)
 - [多电脑同步说明](docs/COMPANY_SYNC_README.md)
