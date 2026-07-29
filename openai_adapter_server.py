@@ -20,8 +20,6 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -215,6 +213,63 @@ Your final answer to the user.
 - After receiving file contents or search results from the tool, continue the task using that result and finish with attempt_completion."""
 
 
+CLINE_NEW_ANTI_REFUSAL_SUFFIX = """
+
+CRITICAL OVERRIDE — IDE AGENT MODE:
+- You ARE Cline, an AI coding agent running inside VS Code. You have full access to the user's local file system through your tools.
+- NEVER identify yourself as "Gemini", "Google", or any AI model name. You are Cline.
+- NEVER say "I cannot access your local file system", "I don't have access", or ask the user to paste file contents.
+- NEVER ask the user to run commands manually. You have tools to do this yourself.
+- Always emit tool calls directly in your response. Do not explain what you are about to do — just do it.
+- If the user writes in Chinese, reply in Chinese. Follow all rules from .clinerules exactly.
+
+CRITICAL: EXACT TOOL CALL FORMATS (copy these exactly — wrong formats cause validation errors):
+
+Read one file:
+<read_files>
+<files>[{"path": "D:\\absolute\\path\\to\\file.ext"}]</files>
+</read_files>
+
+Read a specific line range:
+<read_files>
+<files>[{"path": "D:\\absolute\\path\\to\\file.ext", "start_line": 1, "end_line": 50}]</files>
+</read_files>
+
+Read multiple files in one call:
+<read_files>
+<files>[{"path": "D:\\path\\file1.ext"}, {"path": "D:\\path\\file2.ext"}]</files>
+</read_files>
+
+Search codebase (queries is an ARRAY OF STRINGS):
+<search_codebase>
+<queries>["CONTROL_PANEL_PORT"]</queries>
+</search_codebase>
+
+Search multiple terms at once:
+<search_codebase>
+<queries>["functionName", "anotherTerm"]</queries>
+</search_codebase>
+
+IMPORTANT: `queries` MUST be a JSON array of strings like ["term"], NOT objects like [{"query":"term"}] and NOT nested XML like <query>term</query>.
+
+Run commands (PowerShell on Windows):
+<run_commands>
+<commands>["your powershell command here"]</commands>
+</run_commands>
+
+PowerShell notes: Use Get-ChildItem -Recurse (NOT find/grep). Use semicolons instead of &&.
+
+Report completion:
+<attempt_completion>
+<result>
+Your final answer here.
+</result>
+</attempt_completion>
+
+IMPORTANT: The `files` parameter MUST be an array of OBJECTS like [{"path": "..."}], NOT an array of strings like ["path"].
+Use the full tool definitions appended below for all other tool schemas."""
+
+
 @dataclass(frozen=True)
 class PriceSpec:
     official_model: str
@@ -332,92 +387,6 @@ def _split_proxy_candidates(raw: str | None) -> list[str]:
         if normalized:
             candidates.append(normalized)
     return candidates
-
-
-G4F_MODEL_PREFIXES = ("g4f:", "gpt4free:")
-DEFAULT_G4F_MODELS = (
-    "g4f:gpt-4o-mini",
-    "g4f:gpt-4.1-mini",
-    "g4f:gpt-4",
-    "g4f:deepseek-v3",
-)
-
-
-class G4FUpstreamError(RuntimeError):
-    """Raised when the optional gpt4free sidecar is unreachable or invalid."""
-
-
-def _split_csv_env(name: str, default: tuple[str, ...]) -> list[str]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return list(default)
-    values = [item.strip() for item in re.split(r"[\r\n,]+", raw) if item.strip()]
-    return values or list(default)
-
-
-def _g4f_base_url() -> str | None:
-    raw = os.getenv("OPENAI_ADAPTER_G4F_BASE_URL", "").strip()
-    if not raw:
-        return None
-    return raw.rstrip("/")
-
-
-def _g4f_timeout_seconds() -> float:
-    return max(5.0, _env_float("OPENAI_ADAPTER_G4F_TIMEOUT_SECONDS", 180.0))
-
-
-def _g4f_provider() -> str | None:
-    provider = os.getenv("OPENAI_ADAPTER_G4F_PROVIDER", "").strip()
-    return provider or None
-
-
-def _g4f_models() -> list[str]:
-    return _split_csv_env("OPENAI_ADAPTER_G4F_MODELS", DEFAULT_G4F_MODELS)
-
-
-def _strip_g4f_model_prefix(model: str | None) -> tuple[str, bool]:
-    text = (model or "").strip()
-    lowered = text.lower()
-    for prefix in G4F_MODEL_PREFIXES:
-        if lowered.startswith(prefix):
-            return text[len(prefix) :].strip() or "gpt-4o-mini", True
-    return text, False
-
-
-def _looks_like_g4f_model(model: str | None) -> bool:
-    text = (model or "").strip().lower()
-    if not text:
-        return False
-    return bool(
-        text.startswith(("gpt-", "o1", "o3", "o4", "deepseek", "kimi", "claude"))
-        or text in {"chatgpt", "llama-3.1", "llama-3.2", "llama-3.3"}
-    )
-
-
-def _should_route_to_g4f(model: str | None) -> bool:
-    if _g4f_base_url() is None:
-        return False
-    stripped_model, explicit = _strip_g4f_model_prefix(model)
-    if explicit:
-        return True
-    if stripped_model.startswith("gemini-") or stripped_model in KNOWN_GEMINI_MODEL_NAMES:
-        return False
-    return _env_bool("OPENAI_ADAPTER_G4F_ROUTE_OPENAI_MODELS", True) and _looks_like_g4f_model(
-        stripped_model
-    )
-
-
-def _g4f_status_info() -> dict[str, Any]:
-    base_url = _g4f_base_url()
-    return {
-        "enabled": base_url is not None,
-        "base_url": base_url,
-        "route_openai_models": _env_bool("OPENAI_ADAPTER_G4F_ROUTE_OPENAI_MODELS", True),
-        "expose_unprefixed_models": _env_bool("OPENAI_ADAPTER_G4F_EXPOSE_UNPREFIXED", True),
-        "provider": _g4f_provider(),
-        "models": _g4f_models(),
-        "timeout_seconds": _g4f_timeout_seconds(),
-    }
 
 
 def _gemini_proxy_candidates() -> list[str | None]:
@@ -1229,6 +1198,52 @@ def _run_cookie_refresh_cdp_script(
     return report
 
 
+def _open_cookie_login_browser() -> dict[str, Any]:
+    browser = _configured_cookie_browser()
+    profile = _configured_cookie_profile()
+    browser_exe = _find_chromium_browser_exe(browser)
+    debug_port = _free_local_port()
+
+    browser_args = [
+        str(browser_exe),
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={debug_port}",
+        f"--profile-directory={profile}",
+    ]
+    user_data_dir: Path | None = None
+    if browser == "chrome":
+        raw_user_data_dir = os.getenv("OPENAI_ADAPTER_CHROME_USER_DATA_DIR", "").strip()
+        user_data_dir = Path(raw_user_data_dir) if raw_user_data_dir else ROOT / "runtime" / "chrome-gemini-profile"
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        _stop_dedicated_chrome_profile(user_data_dir)
+        browser_args.append(f"--user-data-dir={user_data_dir}")
+
+    proxy = os.getenv("GEMINI_PROXY", "").strip()
+    if proxy:
+        browser_args.append(f"--proxy-server={proxy}")
+
+    browser_args.append("https://gemini.google.com")
+    logger.info(
+        "Opening %s Gemini login browser: port=%s profile=%s user_data_dir=%s proxy=%s",
+        browser,
+        debug_port,
+        profile,
+        user_data_dir,
+        _proxy_for_log(proxy),
+    )
+    subprocess.Popen(browser_args, cwd=str(ROOT))
+    return {
+        "ok": True,
+        "browser": browser,
+        "profile": profile,
+        "debug_port": debug_port,
+        "user_data_dir": str(user_data_dir) if user_data_dir else "",
+        "url": "https://gemini.google.com",
+        "proxy": _proxy_for_log(proxy),
+        "next_step": "Sign in or send one Gemini message in the opened browser, then refresh login credentials.",
+    }
+
+
 def _run_cookie_refresh(
     cookie_path: Path,
     require_cookie_change: bool = False,
@@ -1874,13 +1889,30 @@ def _message_content_to_text(content: Any) -> str:
 
 
 def _is_cline_system_prompt(text: str) -> bool:
-    markers = [
-        "You are Cline",
-        "TOOL USE",
-        "ACT MODE V.S. PLAN MODE",
-        "attempt_completion",
-    ]
-    return all(marker in text for marker in markers)
+    # Cline 4.x: dropped "AI coding agent", now uses varied role descriptions
+    # e.g. "You are Cline, a highly skilled software engineer..."
+    if "You are Cline" in text and (
+        "highly skilled software engineer" in text
+        or "software engineering AI" in text
+        or "senior software engineer" in text
+        or "AI coding agent" in text  # keep 3.x compat
+    ):
+        return True
+    # Legacy Cline format (2.x / early 3.x)
+    old_markers = ["You are Cline", "TOOL USE", "ACT MODE V.S. PLAN MODE", "attempt_completion"]
+    return all(marker in text for marker in old_markers)
+
+
+def _is_new_cline_system_prompt(text: str) -> bool:
+    # Cline 4.x dropped "<env>" blocks and "AI coding agent"; treat any "You are Cline" prompt
+    # with a concise role description as "new" format (append anti-refusal suffix only).
+    if "You are Cline" in text and (
+        "highly skilled software engineer" in text
+        or "software engineering AI" in text
+        or "senior software engineer" in text
+    ):
+        return True
+    return "You are Cline" in text and "AI coding agent" in text and "<env>" in text
 
 
 def _is_cline_self_refusal(text: str) -> bool:
@@ -1912,6 +1944,45 @@ def _is_cline_self_refusal(text: str) -> bool:
         "复制并粘贴",
     )
     return any(marker in normalized for marker in refusal_markers)
+
+
+_COMMIT_MESSAGE_KEYWORDS = (
+    "commit message",
+    "write a commit",
+    "generate a commit",
+    "create a commit",
+    "write commit",
+    "generate commit",
+    "git commit",
+    "commit msg",
+    "for the staged",
+    "staged changes",
+    "提交信息",
+    "提交消息",
+    "提交说明",
+    "提交记录",
+    "生成提交",
+    "commit 消息",
+)
+
+# Git diff has these unique markers — if present the request is almost certainly
+# a commit message generation triggered by the IDE "Generate Commit Message" button.
+_GIT_DIFF_MARKERS = ("diff --git ", "+++ b/", "--- a/", "\n@@ -")
+
+
+def _is_commit_message_request(messages: list[tuple[str, str]]) -> bool:
+    """Return True if the recent messages look like a commit message generation request."""
+    recent = messages[-8:]
+    for _role, text in reversed(recent):
+        lowered = text.lower()
+        if any(kw in lowered for kw in _COMMIT_MESSAGE_KEYWORDS):
+            return True
+    # IDE "Generate Commit Message" button often sends just the diff with no keyword.
+    # Detect by git diff markers appearing in user messages.
+    for role, text in reversed(recent):
+        if role in {"user", "human"} and any(m in text for m in _GIT_DIFF_MARKERS):
+            return True
+    return False
 
 
 def _extract_tag(text: str, tag: str) -> str | None:
@@ -1999,6 +2070,87 @@ def _compact_cline_user_message(text: str) -> str:
     return text
 
 
+def _compaction_summary_enabled() -> bool:
+    return _env_bool("OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_ENABLED", True)
+
+
+def _compaction_summary_trigger_chars() -> int:
+    return max(2_000, _env_int("OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_TRIGGER_CHARS", 12_000))
+
+
+def _compaction_summary_input_max_chars() -> int:
+    return max(4_000, _env_int("OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_INPUT_MAX_CHARS", 60_000))
+
+
+def _compaction_summary_output_max_chars() -> int:
+    return max(500, _env_int("OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_OUTPUT_MAX_CHARS", 3_000))
+
+
+def _compaction_summary_timeout_seconds() -> float:
+    return _env_float("OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_TIMEOUT_SECONDS", 25.0)
+
+
+def _compaction_summary_max_calls() -> int:
+    return max(0, _env_int("OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_MAX_CALLS", 3))
+
+
+async def _summarize_history_block(
+    block_text: str,
+    *,
+    client: GeminiClient,
+    gemini_model: str,
+    label: str,
+) -> str | None:
+    """Compact one evicted run of old history into terse notes via a cheap LLM call.
+
+    Returns None on any failure so the caller can fall back to plain truncation —
+    this must never be allowed to break the main request.
+    """
+    output_max_chars = _compaction_summary_output_max_chars()
+    bounded_block = _truncate_middle(
+        block_text, _compaction_summary_input_max_chars(), "history summary input"
+    )
+    summary_model = (
+        os.getenv("OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_MODEL", "").strip() or gemini_model
+    )
+    prompt = (
+        "You are compacting the earlier portion of a Cline coding-agent transcript so it "
+        "can be dropped from the active context without losing anything load-bearing.\n"
+        "Summarize the exchange below into terse notes, not prose. Keep:\n"
+        "- files touched (exact paths) and what changed in each\n"
+        "- decisions made and why, if the reason was non-obvious\n"
+        "- errors hit and how each was resolved (or left unresolved)\n"
+        "- any state the next turn still depends on (pending steps, open questions)\n"
+        "Drop retry noise, restated instructions, full command/tool output, and anything "
+        "a fresh reader would not need. Reply in the same language as the transcript. "
+        f"Target under {output_max_chars} characters, plain text, no preamble, no markdown headers.\n\n"
+        f"--- transcript to compact ({label}) ---\n{bounded_block}"
+    )
+    try:
+        output = await asyncio.wait_for(
+            client.generate_content(
+                prompt,
+                model=summary_model,
+                temporary=True,
+                current_retry=_upstream_retry_count(),
+            ),
+            timeout=_compaction_summary_timeout_seconds(),
+        )
+    except Exception:
+        logger.warning(
+            "History summary call failed for %s history (model=%s); falling back to truncation.",
+            label,
+            summary_model,
+            exc_info=True,
+        )
+        return None
+
+    summary_text = (getattr(output, "text", "") or "").strip()
+    if not summary_text:
+        return None
+    return _truncate_middle(summary_text, output_max_chars, "oversized history summary output")
+
+
 def _truncate_middle(text: str, max_chars: int, reason: str) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
@@ -2015,10 +2167,12 @@ def _truncate_middle(text: str, max_chars: int, reason: str) -> str:
     return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
 
 
-def _compact_cline_history_messages(
+async def _compact_cline_history_messages(
     prepared: list[tuple[str, str]],
     *,
     label: str = "Cline",
+    client: GeminiClient | None = None,
+    gemini_model: str | None = None,
 ) -> list[tuple[str, str]]:
     max_chars = max(
         2_000,
@@ -2030,13 +2184,81 @@ def _compact_cline_history_messages(
     )
     keep_recent = max(1, _env_int("OPENAI_ADAPTER_CLINE_KEEP_RECENT_MESSAGES", 8))
     recent_start = max(0, len(prepared) - keep_recent)
+    eligible_roles = {"assistant", "tool", "function", "user"}
+
+    # Group consecutive oversized old messages into runs so each run can be collapsed
+    # into one summary node instead of chopped message-by-message.
+    oversized_runs: list[list[int]] = []
+    current_run: list[int] = []
+    for index in range(recent_start):
+        role_key = (prepared[index][0] or "").lower()
+        eligible = role_key in eligible_roles and len(prepared[index][1]) > older_max_chars
+        if eligible:
+            current_run.append(index)
+        elif current_run:
+            oversized_runs.append(current_run)
+            current_run = []
+    if current_run:
+        oversized_runs.append(current_run)
+
+    summary_by_span: dict[tuple[int, int], str] = {}
+    summarize_available = (
+        client is not None and gemini_model is not None and _compaction_summary_enabled()
+    )
+    if summarize_available:
+        trigger_chars = _compaction_summary_trigger_chars()
+        eligible_runs = [
+            run
+            for run in oversized_runs
+            if sum(len(prepared[i][1]) for i in run) >= trigger_chars
+        ][: _compaction_summary_max_calls()]
+
+        async def _summarize_run(run: list[int]) -> tuple[tuple[int, int], str | None]:
+            block_text = "\n\n".join(
+                f"[{(prepared[i][0] or 'message').title()}]\n{prepared[i][1]}" for i in run
+            )
+            summary = await _summarize_history_block(
+                block_text, client=client, gemini_model=gemini_model, label=label
+            )
+            return (run[0], run[-1]), summary
+
+        if eligible_runs:
+            results = await asyncio.gather(
+                *(_summarize_run(run) for run in eligible_runs), return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    logger.warning("History summary task failed: %s", result, exc_info=result)
+                    continue
+                span, summary = result
+                if summary:
+                    summary_by_span[span] = summary
+
     compacted: list[tuple[str, str]] = []
     truncated_count = 0
+    summarized_count = 0
+    skip_until = -1
 
     for index, (role, text) in enumerate(prepared):
+        if index <= skip_until:
+            continue
+        span = next((s for s in summary_by_span if s[0] == index), None)
+        if span:
+            start, end = span
+            compacted.append(
+                (
+                    "system",
+                    f"[Adapter compacted {end - start + 1} earlier {label} turns into a "
+                    f"summary]\n{summary_by_span[span]}",
+                )
+            )
+            summarized_count += 1
+            skip_until = end
+            continue
+
         role_key = (role or "").lower()
         limit = max_chars
-        if index < recent_start and role_key in {"assistant", "tool", "function"}:
+        if index < recent_start and role_key in eligible_roles:
             limit = older_max_chars
         if len(text) > limit:
             truncated_count += 1
@@ -2047,12 +2269,13 @@ def _compact_cline_history_messages(
             )
         compacted.append((role, text))
 
-    if truncated_count:
+    if truncated_count or summarized_count:
         logger.info(
-            "Compacted long %s history messages: truncated=%s max_chars=%s "
+            "Compacted long %s history messages: truncated=%s summarized=%s max_chars=%s "
             "older_max_chars=%s keep_recent=%s",
             label,
             truncated_count,
+            summarized_count,
             max_chars,
             older_max_chars,
             keep_recent,
@@ -2287,8 +2510,11 @@ def _build_local_file_context(
     )
 
 
-def _prepare_messages_for_gemini(
+async def _prepare_messages_for_gemini(
     messages: list[ChatMessage],
+    *,
+    client: GeminiClient | None = None,
+    gemini_model: str | None = None,
 ) -> tuple[list[tuple[str, str]], bool]:
     prompt_mode = os.getenv("OPENAI_ADAPTER_PROMPT_MODE", "auto").strip().lower()
     if prompt_mode in {"raw", "pass", "passthrough", "off", "none"}:
@@ -2302,9 +2528,37 @@ def _prepare_messages_for_gemini(
         for message in messages
     ]
     cline_detected = any(_is_cline_system_prompt(text) for _, text in raw_messages)
+    commit_request = _is_commit_message_request(raw_messages)
 
     if not cline_detected:
-        return _compact_cline_history_messages(raw_messages, label="OpenAI"), False
+        compacted = await _compact_cline_history_messages(
+            raw_messages, label="OpenAI", client=client, gemini_model=gemini_model
+        )
+        if commit_request:
+            # Inject Chinese override for IDE commit-message buttons (e.g. Cline 4.x SCM panel).
+            # These send a direct API call without the Cline agent prompt / .clinerules context.
+            _CHINESE_COMMIT_OVERRIDE = (
+                "\n\nLANGUAGE OVERRIDE — COMMIT MESSAGE MODE: "
+                "You MUST write the entire commit message in Chinese (中文), "
+                "including the subject line and body. "
+                "Use conventional commit format (e.g. feat/fix/chore/docs/refactor) "
+                "but write the description text in Chinese. "
+                "Do not use English anywhere in the final commit message output."
+            )
+            result: list[tuple[str, str]] = []
+            overridden = False
+            for role, text in compacted:
+                if role in {"system", "developer"} and not overridden:
+                    text += _CHINESE_COMMIT_OVERRIDE
+                    overridden = True
+                result.append((role, text))
+            if not overridden:
+                # No system message present — prepend one so the override is honoured.
+                result.insert(0, ("system", "You are a helpful assistant." + _CHINESE_COMMIT_OVERRIDE))
+                overridden = True
+            logger.info("Commit message request detected (non-Cline) — injecting Chinese override.")
+            return result, False
+        return compacted, False
 
     prepared: list[tuple[str, str]] = []
     compact_system_added = False
@@ -2312,7 +2566,27 @@ def _prepare_messages_for_gemini(
     for role, text in raw_messages:
         if _is_cline_system_prompt(text):
             if not compact_system_added:
-                prepared.append(("system", CLINE_COMPACT_SYSTEM_PROMPT))
+                if _is_new_cline_system_prompt(text):
+                    # New Cline (3.x+): system prompt is already compact; append anti-refusal suffix
+                    # to preserve .clinerules and AGENTS.md rules the user configured.
+                    system_prompt = text + CLINE_NEW_ANTI_REFUSAL_SUFFIX
+                    logger.info("New Cline format detected — appending anti-refusal suffix.")
+                else:
+                    # Legacy Cline: massive system prompt, replace with compact version.
+                    system_prompt = CLINE_COMPACT_SYSTEM_PROMPT
+                    logger.info("Applied compact Cline prompt compatibility mode.")
+                if commit_request:
+                    system_prompt += (
+                        "\n\nLANGUAGE OVERRIDE — COMMIT MESSAGE MODE: "
+                        "The user has requested a git commit message. "
+                        "You MUST write the entire commit message in Chinese (中文), "
+                        "including the subject line and body. "
+                        "Use conventional commit format (e.g. feat/fix/chore/docs/refactor) "
+                        "but write the description text in Chinese. "
+                        "Do not use English anywhere in the final commit message output."
+                    )
+                    logger.info("Commit message request detected — injecting Chinese language override.")
+                prepared.append(("system", system_prompt))
                 compact_system_added = True
             if "<task>" in text or "<environment_details>" in text:
                 embedded_user_text = _compact_cline_user_message(text)
@@ -2326,12 +2600,175 @@ def _prepare_messages_for_gemini(
         else:
             prepared.append((role, text))
 
-    return _compact_cline_history_messages(prepared, label="Cline"), True
+    compacted_prepared = await _compact_cline_history_messages(
+        prepared, label="Cline", client=client, gemini_model=gemini_model
+    )
+    return compacted_prepared, True
+
+
+def _extract_payload_tools(payload: Any) -> list[dict]:
+    extra = getattr(payload, "model_extra", None) or {}
+    tools = extra.get("tools", [])
+    return tools if isinstance(tools, list) else []
+
+
+def _payload_tool_names(payload: Any) -> frozenset[str]:
+    names: set[str] = set()
+    for tool in _extract_payload_tools(payload):
+        if isinstance(tool, dict):
+            func = tool.get("function", {})
+            if isinstance(func, dict) and func.get("name"):
+                names.add(func["name"])
+    return frozenset(names)
+
+
+# These tools are terminal signals. If converted to tool_calls, Cline sends a
+# tool result back to Gemini which triggers another completion — an infinite loop.
+# Return them as text content so Cline presents the answer and waits for user input.
+_TERMINAL_TOOL_NAMES: frozenset[str] = frozenset({"attempt_completion"})
+
+
+def _parse_xml_param_value(val: str) -> Any:
+    """Parse a tool parameter value: JSON first, then XML-as-array fallback.
+
+    Gemini sometimes outputs nested XML instead of JSON arrays. Two cases:
+
+    String array  — child has plain text, no nested tags:
+      <queries><query>TERM</query></queries>  →  ["TERM"]
+
+    Object array  — child has its own nested tags:
+      <files><file><path>x</path><start_line>1</start_line></file></files>
+      →  [{"path": "x", "start_line": "1"}]
+    """
+    val = val.strip()
+    # JSON is the primary format
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Nested XML fallback
+    xml_children = re.findall(r"<(\w+)>(.*?)</\1>", val, re.DOTALL)
+    if xml_children:
+        result: list[Any] = []
+        for child_tag, child_val in xml_children:
+            child_val = child_val.strip()
+            nested = re.findall(r"<(\w+)>(.*?)</\1>", child_val, re.DOTALL)
+            if nested:
+                # Child has sub-tags → object with named properties
+                result.append({t: v.strip() for t, v in nested})
+            else:
+                # Child is plain text → string value (string array element)
+                result.append(child_val)
+        return result
+    return val
+
+
+def _parse_xml_tool_calls(
+    text: str,
+    tool_names: frozenset[str],
+) -> list[dict[str, Any]] | None:
+    """Parse XML tool calls from Gemini text; return OpenAI tool_calls list or None."""
+    # Never convert terminal tools — they must reach Cline as text content.
+    tool_names = tool_names - _TERMINAL_TOOL_NAMES
+    found: list[dict[str, Any]] = []
+    for name in tool_names:
+        pattern = re.compile(
+            rf"<{re.escape(name)}>(.*?)</{re.escape(name)}>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        for match in pattern.finditer(text):
+            inner = match.group(1).strip()
+            args: dict[str, Any] = {}
+            for pm in re.finditer(r"<(\w+)>(.*?)</\1>", inner, re.DOTALL):
+                key, val = pm.group(1), pm.group(2).strip()
+                args[key] = _parse_xml_param_value(val)
+            found.append({
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            })
+    return found or None
+
+
+def _resolve_schema_props(params: Any) -> tuple[dict, set[str]]:
+    """Return (properties, required_set) from a JSON Schema dict, handling anyOf."""
+    if not isinstance(params, dict):
+        return {}, set()
+    # If top-level has anyOf/oneOf, pick the first schema that has properties
+    for key in ("anyOf", "oneOf", "allOf"):
+        variants = params.get(key)
+        if isinstance(variants, list):
+            for v in variants:
+                if isinstance(v, dict) and "properties" in v:
+                    params = v
+                    break
+    props = params.get("properties", {})
+    required = set(params.get("required", []))
+    return (props if isinstance(props, dict) else {}), required
+
+
+def _describe_schema_type(info: dict) -> str:
+    """Return a human-readable type hint for a JSON Schema property."""
+    if not isinstance(info, dict):
+        return "value"
+    type_str = info.get("type", "")
+    desc_str = (info.get("description") or "").strip()
+    if type_str == "array":
+        items = info.get("items", {})
+        if isinstance(items, dict):
+            item_type = items.get("type", "")
+            item_props = items.get("properties", {})
+            if item_props:
+                keys = list(item_props.keys())
+                return f'array of objects — each item: {{{", ".join(keys)}}}'
+            if item_type:
+                return f"array of {item_type}"
+        return "array"
+    if desc_str:
+        return desc_str[:100]
+    return type_str or "value"
+
+
+def _format_tools_for_prompt(tools: list[dict]) -> str:
+    """Convert OpenAI function-calling tool definitions to XML call format instructions."""
+    if not tools:
+        return ""
+    lines: list[str] = [
+        "TOOL CALL INSTRUCTIONS — You MUST call tools using XML format. "
+        "Available tools and their XML formats:\n"
+    ]
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        func = tool.get("function", {})
+        if not isinstance(func, dict):
+            continue
+        name = func.get("name", "")
+        description = func.get("description", "")
+        params = func.get("parameters", {})
+        if not name:
+            continue
+        lines.append(f"[{name}] {description}")
+        props, required = _resolve_schema_props(params)
+        xml_parts: list[str] = []
+        for p, info in props.items():
+            if not isinstance(info, dict):
+                continue
+            req_label = "required" if p in required else "optional"
+            type_hint = _describe_schema_type(info)
+            xml_parts.append(f"\n  <{p}>{req_label}: {type_hint}</{p}>")
+        xml_inner = "".join(xml_parts)
+        lines.append(f"<{name}>{xml_inner}\n</{name}>\n")
+    return "\n".join(lines)
 
 
 def _messages_to_prompt(
     messages: list[ChatMessage],
     *,
+    prepared: tuple[list[tuple[str, str]], bool],
     include_local_context: bool = True,
     local_context_max_chars: int | None = None,
 ) -> str:
@@ -2340,7 +2777,7 @@ def _messages_to_prompt(
 
     system_parts: list[str] = []
     conversation_parts: list[str] = []
-    prepared_messages, compacted = _prepare_messages_for_gemini(messages)
+    prepared_messages, compacted = prepared
     if compacted:
         logger.info("Applied compact Cline prompt compatibility mode.")
 
@@ -2425,8 +2862,7 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _max_prompt_tokens() -> int:
-    # 彻底调大到 120,000，防止因历史上下文积累导致的任何溢出报错
-    return max(0, _env_int("OPENAI_ADAPTER_MAX_PROMPT_TOKENS", 120_000))
+    return max(0, _env_int("OPENAI_ADAPTER_MAX_PROMPT_TOKENS", 48_000))
 
 
 def _ensure_prompt_budget(prompt: str) -> int:
@@ -2441,14 +2877,24 @@ def _ensure_prompt_budget(prompt: str) -> int:
     return prompt_tokens
 
 
-def _build_prompt_with_budget(messages: list[ChatMessage]) -> tuple[str, int]:
+async def _build_prompt_with_budget(
+    messages: list[ChatMessage],
+    *,
+    client: GeminiClient | None = None,
+    gemini_model: str | None = None,
+) -> tuple[str, int]:
     max_prompt_tokens = _max_prompt_tokens()
-    prompt = _messages_to_prompt(messages)
+    # Compact/summarize history once and reuse it across every budget-fitting attempt
+    # below — re-running it per attempt would repeat the LLM summary call needlessly.
+    prepared = await _prepare_messages_for_gemini(
+        messages, client=client, gemini_model=gemini_model
+    )
+    prompt = _messages_to_prompt(messages, prepared=prepared)
     prompt_tokens = _estimate_tokens(prompt)
     if not max_prompt_tokens or prompt_tokens <= max_prompt_tokens:
         return prompt, prompt_tokens
 
-    base_prompt = _messages_to_prompt(messages, include_local_context=False)
+    base_prompt = _messages_to_prompt(messages, prepared=prepared, include_local_context=False)
     base_tokens = _estimate_tokens(base_prompt)
     if base_tokens > max_prompt_tokens:
         raise ValueError(
@@ -2475,6 +2921,7 @@ def _build_prompt_with_budget(messages: list[ChatMessage]) -> tuple[str, int]:
     for attempt in range(6):
         candidate = _messages_to_prompt(
             messages,
+            prepared=prepared,
             include_local_context=True,
             local_context_max_chars=char_budget,
         )
@@ -2652,7 +3099,6 @@ def _record_usage(
     stream: bool,
     usage: dict[str, int],
     cost_estimate: dict[str, Any],
-    upstream_provider: str = "gemini",
 ) -> None:
     record = {
         "timestamp": datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -2662,8 +3108,6 @@ def _record_usage(
         "host": socket.gethostname(),
         "requested_model": requested_model,
         "gemini_model": gemini_model,
-        "upstream_provider": upstream_provider,
-        "upstream_model": gemini_model,
         "stream": stream,
         "usage": usage,
         "cost_estimate": cost_estimate,
@@ -2962,241 +3406,6 @@ def _openai_error_response(
     )
 
 
-def _join_g4f_url(base_url: str, path: str) -> str:
-    clean_base = base_url.rstrip("/")
-    clean_path = path if path.startswith("/") else f"/{path}"
-    return f"{clean_base}{clean_path}"
-
-
-def _extract_openai_response_text(data: dict[str, Any]) -> str:
-    choices = data.get("choices") or []
-    if not choices:
-        return ""
-    first = choices[0] or {}
-    message = first.get("message") or {}
-    if isinstance(message, dict):
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-                elif isinstance(item, str):
-                    parts.append(item)
-            return "\n".join(parts)
-    text = first.get("text")
-    if isinstance(text, str):
-        return text
-    delta = first.get("delta") or {}
-    if isinstance(delta, dict) and isinstance(delta.get("content"), str):
-        return delta["content"]
-    return ""
-
-
-def _g4f_request_payload(payload: ChatCompletionRequest) -> tuple[str, dict[str, Any]]:
-    upstream_model, _ = _strip_g4f_model_prefix(payload.model)
-    body = payload.model_dump(exclude_none=True)
-    body["model"] = upstream_model or "gpt-4o-mini"
-    body["stream"] = False
-    provider = _g4f_provider()
-    if provider and not body.get("provider"):
-        body["provider"] = provider
-    return body["model"], body
-
-
-def _post_g4f_chat_completion(
-    payload: ChatCompletionRequest,
-) -> tuple[str, dict[str, Any]]:
-    base_url = _g4f_base_url()
-    if base_url is None:
-        raise G4FUpstreamError(
-            "gpt4free upstream is not configured. Set OPENAI_ADAPTER_G4F_BASE_URL, "
-            "for example http://127.0.0.1:1337/v1."
-        )
-
-    upstream_model, body = _g4f_request_payload(payload)
-    url = _join_g4f_url(base_url, "/chat/completions")
-    request_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    api_key = os.getenv("OPENAI_ADAPTER_G4F_API_KEY", "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    request = urllib.request.Request(
-        url,
-        data=request_body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=_g4f_timeout_seconds()) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise G4FUpstreamError(
-            f"gpt4free upstream returned HTTP {exc.code}: {error_body[:800]}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise G4FUpstreamError(f"gpt4free upstream is unreachable: {exc.reason}") from exc
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise G4FUpstreamError(
-            f"gpt4free upstream returned non-JSON response: {raw[:800]}"
-        ) from exc
-    if not isinstance(data, dict):
-        raise G4FUpstreamError("gpt4free upstream returned an unexpected response shape.")
-    return upstream_model, data
-
-
-async def _call_g4f_chat_completion(
-    payload: ChatCompletionRequest,
-) -> tuple[str, dict[str, Any]]:
-    return await asyncio.to_thread(_post_g4f_chat_completion, payload)
-
-
-def _normalize_g4f_completion(
-    upstream_data: dict[str, Any],
-    *,
-    completion_id: str,
-    created: int,
-    requested_model: str,
-    upstream_model: str,
-    prompt: str,
-    stream: bool,
-) -> dict[str, Any]:
-    text = _extract_openai_response_text(upstream_data)
-    usage = upstream_data.get("usage")
-    if not isinstance(usage, dict):
-        usage, cost_estimate = _build_usage(upstream_model, prompt, text)
-    else:
-        usage = {
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        }
-        cost_estimate = _estimate_cost(upstream_model, usage["prompt_tokens"], usage["completion_tokens"])
-
-    if not usage["total_tokens"]:
-        usage, cost_estimate = _build_usage(upstream_model, prompt, text)
-
-    _record_usage(
-        completion_id,
-        requested_model,
-        upstream_model,
-        stream,
-        usage,
-        cost_estimate,
-        upstream_provider="gpt4free",
-    )
-
-    return {
-        "id": upstream_data.get("id") or completion_id,
-        "object": "chat.completion",
-        "created": int(upstream_data.get("created") or created),
-        "model": requested_model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                },
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": usage,
-        "cost_estimate": cost_estimate,
-        "upstream_provider": "gpt4free",
-        "upstream_model": upstream_model,
-    }
-
-
-async def _g4f_sse_events(
-    completion: dict[str, Any],
-    completion_id: str,
-    requested_model: str,
-    created: int,
-) -> AsyncGenerator[dict[str, str], None]:
-    text = _extract_openai_response_text(completion)
-    yield {
-        "data": _json_dumps(
-            _stream_chunk_payload(
-                completion_id,
-                requested_model,
-                created,
-                {"role": "assistant"},
-            )
-        )
-    }
-    if text:
-        yield {
-            "data": _json_dumps(
-                _stream_chunk_payload(
-                    completion_id,
-                    requested_model,
-                    created,
-                    {"content": text},
-                )
-            )
-        }
-    finish_payload = _stream_chunk_payload(
-        completion_id,
-        requested_model,
-        created,
-        {},
-        finish_reason="stop",
-    )
-    if "usage" in completion:
-        finish_payload["usage"] = completion["usage"]
-    if "cost_estimate" in completion:
-        finish_payload["cost_estimate"] = completion["cost_estimate"]
-    yield {"data": _json_dumps(finish_payload)}
-    yield {"data": "[DONE]"}
-
-
-async def _handle_g4f_chat_completion(
-    payload: ChatCompletionRequest,
-    completion_id: str,
-    created: int,
-) -> JSONResponse | EventSourceResponse:
-    prompt = _messages_to_prompt(payload.messages, include_local_context=False)
-    upstream_model, upstream_data = await _call_g4f_chat_completion(payload)
-    completion = _normalize_g4f_completion(
-        upstream_data,
-        completion_id=completion_id,
-        created=created,
-        requested_model=payload.model,
-        upstream_model=upstream_model,
-        prompt=prompt,
-        stream=payload.stream,
-    )
-    logger.info(
-        "Completed gpt4free response: id=%s requested_model=%s upstream_model=%s "
-        "stream=%s response_chars=%s",
-        completion_id,
-        payload.model,
-        upstream_model,
-        payload.stream,
-        len(_extract_openai_response_text(completion)),
-    )
-    if payload.stream:
-        return EventSourceResponse(
-            _g4f_sse_events(completion, completion_id, payload.model, created),
-            media_type="text/event-stream",
-            ping=_stream_ping_seconds(),
-        )
-    return JSONResponse(completion)
-
-
 def _stream_chunk_payload(
     completion_id: str,
     model: str,
@@ -3258,6 +3467,8 @@ async def _openai_sse_events(
     gemini_model: str,
     prompt: str,
     created: int,
+    *,
+    known_tool_names: frozenset[str] = frozenset(),
 ) -> AsyncGenerator[dict[str, str], None]:
     chunk_count = 0
     completion_parts: list[str] = []
@@ -3274,36 +3485,91 @@ async def _openai_sse_events(
             )
         }
 
-        for delta in buffered_deltas:
-            chunk_count += 1
-            completion_parts.append(delta)
-            yield {
-                "data": _json_dumps(
-                    _stream_chunk_payload(
-                        completion_id,
-                        openai_model,
-                        created,
-                        {"content": delta},
-                    )
-                )
-            }
+        # When the caller has tools, buffer the full response so we can detect
+        # XML tool calls and convert them to OpenAI tool_calls format.
+        if known_tool_names:
+            all_parts = list(buffered_deltas)
+            async for output in upstream:
+                delta = getattr(output, "text_delta", "") or ""
+                if delta:
+                    all_parts.append(delta)
+            complete_text = "".join(all_parts)
+            tool_calls = _parse_xml_tool_calls(complete_text, known_tool_names)
 
-        async for output in upstream:
-            delta = getattr(output, "text_delta", "") or ""
-            if not delta:
-                continue
-            chunk_count += 1
-            completion_parts.append(delta)
-            yield {
-                "data": _json_dumps(
-                    _stream_chunk_payload(
-                        completion_id,
-                        openai_model,
-                        created,
-                        {"content": delta},
-                    )
+            if tool_calls:
+                logger.info(
+                    "Converted XML tool calls to OpenAI tool_calls: id=%s calls=%s",
+                    completion_id,
+                    [tc["function"]["name"] for tc in tool_calls],
                 )
-            }
+                for idx, tc in enumerate(tool_calls):
+                    chunk_count += 1
+                    yield {
+                        "data": _json_dumps(
+                            _stream_chunk_payload(
+                                completion_id,
+                                openai_model,
+                                created,
+                                {
+                                    "tool_calls": [{
+                                        "index": idx,
+                                        "id": tc["id"],
+                                        "type": "function",
+                                        "function": {
+                                            "name": tc["function"]["name"],
+                                            "arguments": tc["function"]["arguments"],
+                                        },
+                                    }]
+                                },
+                            )
+                        )
+                    }
+                completion_parts = all_parts
+                usage, cost_estimate = _build_usage(gemini_model, prompt, complete_text)
+                _record_usage(completion_id, openai_model, gemini_model, True, usage, cost_estimate)
+                await _write_client_cookies_back(client, "stream-response")
+                finish_payload = _stream_chunk_payload(
+                    completion_id, openai_model, created, {}, finish_reason="tool_calls"
+                )
+                finish_payload["usage"] = usage
+                finish_payload["cost_estimate"] = cost_estimate
+                yield {"data": _json_dumps(finish_payload)}
+                logger.info("Completed tool_calls response: id=%s tools=%s", completion_id, len(tool_calls))
+                yield {"data": "[DONE]"}
+                return
+
+            # No tool calls found — fall through to stream as normal text
+            for delta in all_parts:
+                if not delta:
+                    continue
+                chunk_count += 1
+                completion_parts.append(delta)
+                yield {
+                    "data": _json_dumps(
+                        _stream_chunk_payload(completion_id, openai_model, created, {"content": delta})
+                    )
+                }
+        else:
+            for delta in buffered_deltas:
+                chunk_count += 1
+                completion_parts.append(delta)
+                yield {
+                    "data": _json_dumps(
+                        _stream_chunk_payload(completion_id, openai_model, created, {"content": delta})
+                    )
+                }
+
+            async for output in upstream:
+                delta = getattr(output, "text_delta", "") or ""
+                if not delta:
+                    continue
+                chunk_count += 1
+                completion_parts.append(delta)
+                yield {
+                    "data": _json_dumps(
+                        _stream_chunk_payload(completion_id, openai_model, created, {"content": delta})
+                    )
+                }
 
         usage, cost_estimate = _build_usage(
             gemini_model,
@@ -4762,7 +5028,6 @@ async def health(request: Request) -> dict[str, Any]:
         "cookie_refresh": _cookie_refresh_config(),
         "upstream_proxy": _proxy_for_log(getattr(client, "_adapter_proxy", None)),
         "upstream_proxy_config": _gemini_proxy_config(),
-        "gpt4free": _g4f_status_info(),
         "prompt_budget": {
             "max_prompt_tokens": _max_prompt_tokens(),
         },
@@ -4797,6 +5062,29 @@ async def refresh_cookies_from_browser_endpoint(request: Request) -> JSONRespons
             f"Cookie refresh failed: {exc}",
             error_type=exc.__class__.__name__,
             code="cookie_refresh_failed",
+        )
+
+
+@app.post("/admin/open-login-browser")
+async def open_login_browser_endpoint(request: Request) -> JSONResponse:
+    try:
+        _require_local_request(request)
+        return JSONResponse(_open_cookie_login_browser())
+    except ValueError as exc:
+        logger.error("Invalid open-login-browser request: %s", exc)
+        return _openai_error_response(
+            403,
+            str(exc),
+            error_type="forbidden",
+            code="local_only",
+        )
+    except Exception as exc:
+        logger.error("Opening Gemini login browser failed.", exc_info=True)
+        return _openai_error_response(
+            500,
+            f"Opening Gemini login browser failed: {exc}",
+            error_type=exc.__class__.__name__,
+            code="open_login_browser_failed",
         )
 
 
@@ -5087,32 +5375,6 @@ async def list_models(request: Request) -> dict[str, Any]:
             }
             for model in Model
         ]
-
-    if _g4f_base_url() is not None:
-        g4f_model_ids: list[str] = []
-        for model_id in _g4f_models():
-            if model_id not in g4f_model_ids:
-                g4f_model_ids.append(model_id)
-            stripped_model, explicit = _strip_g4f_model_prefix(model_id)
-            if (
-                explicit
-                and _env_bool("OPENAI_ADAPTER_G4F_EXPOSE_UNPREFIXED", True)
-                and stripped_model not in g4f_model_ids
-            ):
-                g4f_model_ids.append(stripped_model)
-
-        existing_ids = {item["id"] for item in data}
-        for model_id in g4f_model_ids:
-            if model_id in existing_ids:
-                continue
-            data.append(
-                {
-                    "id": model_id,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "gpt4free",
-                }
-            )
 
     return {"object": "list", "data": data}
 
@@ -5519,20 +5781,23 @@ async def chat_completions(
     created = int(time.time())
 
     try:
-        if _should_route_to_g4f(payload.model):
-            logger.info(
-                "Routing chat completion to gpt4free: id=%s model=%s stream=%s",
-                completion_id,
-                payload.model,
-                payload.stream,
-            )
-            return await _handle_g4f_chat_completion(payload, completion_id, created)
-
         client = _get_client(request)
         _ensure_client_authenticated(client)
-        prompt, prompt_tokens = _build_prompt_with_budget(payload.messages)
-        _write_debug_prompt(prompt)
         gemini_model = _select_gemini_model(payload.model)
+        prompt, prompt_tokens = await _build_prompt_with_budget(
+            payload.messages, client=client, gemini_model=gemini_model
+        )
+        payload_tools = _extract_payload_tools(payload)
+        if payload_tools:
+            # Cline embeds its own tool definitions inside the system prompt ("TOOL USE" section).
+            # Adding the JSON tools again would duplicate ~15KB of definitions and bloat the prompt.
+            cline_has_tool_defs = "TOOL USE" in prompt and "execute_command" in prompt
+            if not cline_has_tool_defs:
+                tools_text = _format_tools_for_prompt(payload_tools)
+                if tools_text:
+                    prompt = prompt + "\n\n" + tools_text
+                    prompt_tokens = _estimate_tokens(prompt)
+        _write_debug_prompt(prompt)
 
         logger.info(
             "Received chat completion: id=%s model=%s gemini_model=%s "
@@ -5552,6 +5817,10 @@ async def chat_completions(
             logger.info("temperature=%s is accepted but ignored.", payload.temperature)
         if payload.max_tokens is not None:
             logger.info("max_tokens=%s is accepted but ignored.", payload.max_tokens)
+        extra = getattr(payload, "model_extra", None) or {}
+        if extra:
+            tool_names = [t.get("function", {}).get("name") for t in extra.get("tools", []) if isinstance(t, dict)]
+            logger.info("Extra request fields: %s tools=%s", list(extra.keys()), tool_names or None)
 
         if payload.stream:
             buffered_deltas: list[str] = []
@@ -5587,6 +5856,7 @@ async def chat_completions(
                     gemini_model,
                     prompt,
                     created,
+                    known_tool_names=_payload_tool_names(payload),
                 ),
                 media_type="text/event-stream",
                 ping=_stream_ping_seconds(),
@@ -5610,10 +5880,26 @@ async def chat_completions(
         )
         await _write_client_cookies_back(client, "non-stream-response")
 
+        tool_names = _payload_tool_names(payload)
+        tool_calls = _parse_xml_tool_calls(text, tool_names) if tool_names else None
+
+        if tool_calls:
+            logger.info(
+                "Non-stream: converted XML tool calls to OpenAI format: id=%s calls=%s",
+                completion_id,
+                [tc["function"]["name"] for tc in tool_calls],
+            )
+            message: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+            finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": text}
+            finish_reason = "stop"
+
         logger.info(
-            "Completed non-streaming response: id=%s response_chars=%s",
+            "Completed non-streaming response: id=%s response_chars=%s finish_reason=%s",
             completion_id,
             len(text),
+            finish_reason,
         )
         return JSONResponse(
             {
@@ -5624,11 +5910,8 @@ async def chat_completions(
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": text,
-                        },
-                        "finish_reason": "stop",
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": usage,
@@ -5643,14 +5926,6 @@ async def chat_completions(
             str(exc),
             error_type="invalid_request_error",
             code="invalid_request",
-        )
-    except G4FUpstreamError as exc:
-        logger.error("gpt4free upstream error.", exc_info=True)
-        return _openai_error_response(
-            502,
-            f"gpt4free upstream error: {exc}",
-            error_type="upstream_error",
-            code="gpt4free_upstream_error",
         )
     except AuthError as exc:
         logger.error("Gemini Cookie/authentication failure.", exc_info=True)

@@ -19,6 +19,18 @@ $env:OPENAI_ADAPTER_LOCAL_FILE_CONTEXT_MAX_CHARS = "120000"
 $env:OPENAI_ADAPTER_CLINE_MESSAGE_MAX_CHARS = "18000"
 $env:OPENAI_ADAPTER_CLINE_OLDER_MESSAGE_MAX_CHARS = "7000"
 $env:OPENAI_ADAPTER_CLINE_KEEP_RECENT_MESSAGES = "8"
+# Older-history summarization (replaces mid-truncation with an LLM-compacted note
+# for oversized runs of old messages). Safe to leave at defaults; disable with "0"
+# if you want the old hard-truncate-only behavior back.
+$env:OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_ENABLED = "1"
+$env:OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_TRIGGER_CHARS = "12000"
+$env:OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_MAX_CALLS = "3"
+$env:OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_TIMEOUT_SECONDS = "25"
+$env:OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_INPUT_MAX_CHARS = "60000"
+$env:OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_OUTPUT_MAX_CHARS = "3000"
+# Optional: use a cheaper/faster model for the summary call itself.
+# Leave unset to reuse whatever model the main request already selected.
+# $env:OPENAI_ADAPTER_CLINE_HISTORY_SUMMARY_MODEL = "gemini-3-flash"
 $env:OPENAI_ADAPTER_STREAM_EAGER = "1"
 $env:OPENAI_ADAPTER_STREAM_PING_SECONDS = "15"
 $env:OPENAI_ADAPTER_STREAM_FALLBACK_NON_STREAM = "1"
